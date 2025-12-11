@@ -1,34 +1,43 @@
 #!/usr/bin/env python3
 """
-Precompute EMoE scene labels and scene anchors from nuPlan.
+Precompute EMoE scene labels + scene anchors from nuPlan.
 
-Outputs:
-  - scene_labels.jsonl : one line per scenario: token -> emoe_class_id + debug + stage
-  - scene_anchors.npy  : shape [7, Ka, 2], KMeans over trajectory endpoints per class
+Outputs (in --output_dir):
+  - scene_labels.jsonl  : one line per scenario (token -> emoe_class_id + debug + stage_used)
+  - scene_anchors.npy   : shape [7, Ka, 2] (KMeans on GT trajectory endpoints per class)
 
-Classification logic (agreed):
-  1) Direct tag overrides:
-       - right turn tags  -> RIGHT_TURN_AT_INTERSECTION (2)
-       - u-turn tags      -> U_TURN (5)
-       - roundabout tags  -> ROUNDABOUT (4)
-  2) Otherwise:
-       - Determine intersection context using LANE_CONNECTOR.intersection_fid (near ego)
-       - Determine maneuver using ego geometry (net heading, accumulated turn, etc.)
-       - Use connector turn_type_fid as tie-break ONLY when geometry is ambiguous
-         (ignore NONE)
+Pipeline (stages):
+  Stage 1 (tags/strings first):
+    - roundabout -> class 4
+    - u-turn     -> class 5
+    - starting_right_turn / right_turn -> class 2   (DIRECT, as you requested)
+    - other “turn-ish” tags -> sent to geometry/map verification (not directly left/right)
 
-Anchors:
-  - cluster ONLY trajectory endpoints in the initial ego frame (x,y)
+  Stage 2 (map semantics):
+    - detect roundabout via map lane/roadblock properties if available
+    - detect intersection presence
+    - detect lane connector turn direction if available (LEFT/RIGHT/UTURN)
 
-Run (example):
+  Stage 3 (geometry, with FIXED logic):
+    - HARD motion gate: stationary/slow-jitter can’t become LEFT/RIGHT
+    - If intersection present (map OR tag hint):
+        use NET heading (delta_heading) to decide LEFT/RIGHT/STRAIGHT at intersection
+    - Outside intersection:
+        only STRAIGHT_NON_INTERSECTION vs OTHERS (no left/right from curvature)
+
+Notes on GPU:
+  - This script is CPU-bound (nuPlan DB + map I/O + GeoPandas/Shapely internals).
+  - Geometry math is cheap; GPU won’t speed up the dominant bottlenecks.
+
+Run:
   export NUPLAN_DATA_ROOT=/path/to/nuplan
   export NUPLAN_MAPS_ROOT=/path/to/nuplan/maps
 
-  python emoe_precompute_labels_and_anchors.py \
+  python precompute_emoe_labels_anchors.py \
     --split mini \
-    --output_dir /path/to/out \
+    --output_dir ./emoe_precomputed_mini \
     --Ka 24 \
-    --max_scenarios 20000
+    --max_scenarios -1
 """
 
 import os
@@ -37,24 +46,22 @@ import math
 import argparse
 from pathlib import Path
 from collections import defaultdict, Counter
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Optional, Any, Dict, List, Tuple
 
 import numpy as np
 from tqdm import tqdm
+
+from sklearn.cluster import KMeans
 
 # nuPlan imports
 from nuplan.planning.scenario_builder.nuplan_db.nuplan_scenario_builder import NuPlanScenarioBuilder
 from nuplan.planning.scenario_builder.scenario_filter import ScenarioFilter
 from nuplan.planning.utils.multithreading.worker_pool import SingleMachineParallelExecutor
-from nuplan.common.maps.maps_datatypes import SemanticMapLayer
-
-# clustering
-from sklearn.cluster import MiniBatchKMeans
 
 
-# ------------------------------------------------------------
-# EMoE class names (fixed)
-# ------------------------------------------------------------
+# --------------------------------------------------------------------------------------
+# EMoE class names
+# --------------------------------------------------------------------------------------
 EMOE_SCENE_TYPES = [
     "left_turn_at_intersection",      # 0
     "straight_at_intersection",       # 1
@@ -66,9 +73,26 @@ EMOE_SCENE_TYPES = [
 ]
 
 
-# ------------------------------------------------------------
-# Basic utils
-# ------------------------------------------------------------
+# --------------------------------------------------------------------------------------
+# Geometry thresholds / gates (tuned to avoid stationary false turns)
+# --------------------------------------------------------------------------------------
+MIN_DIST_ANY = 5.0                         # ignore tiny motion entirely
+MIN_DIST_TURN_AT_INTERSECTION = 12.0       # require real motion to call LEFT/RIGHT at intersection
+
+NET_STRAIGHT_MAX_AT_INTERSECTION = math.radians(12.0)   # |Δθ| <= 12° -> straight at intersection
+NET_TURN_MIN_AT_INTERSECTION = math.radians(18.0)       # |Δθ| >= 18° -> turn candidate
+NET_TURN_MAX_AT_INTERSECTION = math.radians(165.0)      # avoid near-UTURN confusion
+
+UTURN_CENTER = math.pi
+UTURN_MARGIN = math.radians(35.0)
+
+ROUNDABOUT_TOTAL_MIN = math.radians(270.0)              # fallback only
+ROUNDABOUT_NET_MAX = math.radians(90.0)                 # fallback only
+
+
+# --------------------------------------------------------------------------------------
+# Basic helpers
+# --------------------------------------------------------------------------------------
 def wrap_to_pi(angle: float) -> float:
     """Wrap angle to [-pi, pi]."""
     return (angle + math.pi) % (2.0 * math.pi) - math.pi
@@ -76,33 +100,25 @@ def wrap_to_pi(angle: float) -> float:
 
 def compute_ego_xyh(scenario) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Extract ego rear-axle x, y, heading over the scenario horizon."""
-    xs_list: List[float] = []
-    ys_list: List[float] = []
-    hs_list: List[float] = []
-    n = scenario.get_number_of_iterations()
-    for i in range(n):
+    xs, ys, hs = [], [], []
+    for i in range(scenario.get_number_of_iterations()):
         ego = scenario.get_ego_state_at_iteration(i)
-        xs_list.append(ego.rear_axle.x)
-        ys_list.append(ego.rear_axle.y)
-        hs_list.append(float(ego.rear_axle.heading))
-    return (
-        np.asarray(xs_list, dtype=np.float64),
-        np.asarray(ys_list, dtype=np.float64),
-        np.asarray(hs_list, dtype=np.float64),
-    )
+        xs.append(ego.rear_axle.x)
+        ys.append(ego.rear_axle.y)
+        hs.append(float(ego.rear_axle.heading))
+    return np.asarray(xs, dtype=np.float64), np.asarray(ys, dtype=np.float64), np.asarray(hs, dtype=np.float64)
 
 
-def endpoint_in_initial_ego_frame(xs: np.ndarray, ys: np.ndarray, hs: np.ndarray) -> np.ndarray:
-    """
-    Endpoint (x,y) in the initial ego frame.
-    """
+def ego_endpoint_in_ego_frame(xs: np.ndarray, ys: np.ndarray, hs: np.ndarray) -> np.ndarray:
+    """Final endpoint in the initial ego frame: (x_rel, y_rel)."""
     if len(xs) < 2:
         return np.array([0.0, 0.0], dtype=np.float32)
 
-    dx = float(xs[-1] - xs[0])
-    dy = float(ys[-1] - ys[0])
-    theta0 = float(hs[0])
+    x0, y0 = float(xs[0]), float(ys[0])
+    xT, yT = float(xs[-1]), float(ys[-1])
+    dx, dy = xT - x0, yT - y0
 
+    theta0 = float(hs[0])
     c = math.cos(-theta0)
     s = math.sin(-theta0)
     x_rel = c * dx - s * dy
@@ -110,37 +126,323 @@ def endpoint_in_initial_ego_frame(xs: np.ndarray, ys: np.ndarray, hs: np.ndarray
     return np.array([x_rel, y_rel], dtype=np.float32)
 
 
-# ------------------------------------------------------------
-# Scenario loading (hard cap applied in main)
-# ------------------------------------------------------------
-def build_scenarios(split: str, max_workers: int = 8) -> List[Any]:
+# --------------------------------------------------------------------------------------
+# Stage 1: tag/string-based priority mapping
+# --------------------------------------------------------------------------------------
+def _upper(x: Any) -> str:
+    return str(x).upper() if x is not None else ""
+
+
+def get_scenario_tags_if_available(scenario) -> List[str]:
     """
-    Load scenarios (may return many; we hard-slice in main with --max_scenarios).
+    Best-effort tag extraction. nuPlan devkit versions differ.
+    If your scenario object exposes tags, we use them; otherwise empty list.
     """
-    data_root = os.environ.get("NUPLAN_DATA_ROOT", None)
-    map_root = os.environ.get("NUPLAN_MAPS_ROOT", None)
-    if data_root is None or map_root is None:
-        raise RuntimeError(
-            "Please set NUPLAN_DATA_ROOT and NUPLAN_MAPS_ROOT.\n"
-            "Example:\n"
-            "  export NUPLAN_DATA_ROOT=/path/to/nuplan\n"
-            "  export NUPLAN_MAPS_ROOT=/path/to/nuplan/maps"
-        )
+    tags: List[str] = []
+    # Common patterns people sometimes have in their own wrappers:
+    for attr in ["tags", "scenario_tags", "log_tags"]:
+        if hasattr(scenario, attr):
+            try:
+                val = getattr(scenario, attr)
+                if isinstance(val, (list, tuple)):
+                    tags.extend([_upper(t) for t in val])
+            except Exception:
+                pass
+
+    # Some devkit versions expose scenario metadata methods; keep best-effort
+    for method in ["get_tags", "get_scenario_tags"]:
+        if hasattr(scenario, method):
+            try:
+                val = getattr(scenario, method)()
+                if isinstance(val, (list, tuple)):
+                    tags.extend([_upper(t) for t in val])
+            except Exception:
+                pass
+
+    # de-dup preserving order
+    seen = set()
+    out = []
+    for t in tags:
+        if t and t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
+
+def stage1_from_tags_and_type(scenario_type: str, tags: List[str]) -> Tuple[Optional[int], Optional[str]]:
+    """
+    Returns (class_id, stage_name) if decided, else (None, None).
+
+    Your requirement:
+      - classify right turn tags directly as RIGHT
+      - classify U-turn and roundabout directly
+      - other turn-ish tags go to geometry verification (not direct left/right)
+    """
+    st = _upper(scenario_type)
+    tset = set(tags)
+
+    # Direct: roundabout
+    if "ROUNDABOUT" in st or any("ROUNDABOUT" in t for t in tset):
+        return 4, "stage1_tags"
+
+    # Direct: u-turn
+    if "UTURN" in st or "U_TURN" in st or any(("UTURN" in t or "U_TURN" in t) for t in tset):
+        return 5, "stage1_tags"
+
+    # Direct: right turn
+    # (covers strings you mentioned like STARTING_RIGHT_TURN)
+    if ("STARTING_RIGHT" in st and "TURN" in st) or ("RIGHT_TURN" in st) or any(("STARTING_RIGHT" in t and "TURN" in t) for t in tset):
+        return 2, "stage1_tags"
+
+    # Everything else: do NOT directly force left/right here (send to stage2/3)
+    return None, None
+
+
+def tag_intersection_hint(scenario_type: str, tags: List[str]) -> bool:
+    """
+    Conservative: treat these as intersection context hints.
+    """
+    st = _upper(scenario_type)
+    tset = set(tags)
+    keys = ["INTERSECTION", "TRAFFIC_LIGHT", "STOP_SIGN", "TRAVERSING_INTERSECTION", "ON_INTERSECTION"]
+    if any(k in st for k in keys):
+        return True
+    if any(any(k in t for k in keys) for t in tset):
+        return True
+    return False
+
+
+# --------------------------------------------------------------------------------------
+# Stage 2: map-based flags (best-effort, version-robust)
+# --------------------------------------------------------------------------------------
+def get_lane_objects_along_trajectory(scenario, xs: np.ndarray, ys: np.ndarray, step: int = 5) -> List[Any]:
+    """
+    Sample along ego trajectory and retrieve lane or lane_connector objects via map_api.
+    We subsample every 'step' frames to limit calls.
+    """
+    lanes: List[Any] = []
+    map_api = getattr(scenario, "map_api", None)
+    if map_api is None:
+        return lanes
+
+    for i in range(0, len(xs), step):
+        x = float(xs[i])
+        y = float(ys[i])
+        lane = None
+        try:
+            if hasattr(map_api, "get_one_lane_or_lane_connector_from_point"):
+                lane = map_api.get_one_lane_or_lane_connector_from_point(x, y)
+            elif hasattr(map_api, "get_one_lane_or_lane_connector"):
+                lane = map_api.get_one_lane_or_lane_connector(x, y)
+        except Exception:
+            lane = None
+        if lane is not None:
+            lanes.append(lane)
+    return lanes
+
+
+def map_based_flags_from_lanes(lanes: List[Any]) -> Tuple[bool, bool, Optional[int]]:
+    """
+    From lane/lane_connector objects, derive:
+      - has_intersection
+      - has_roundabout
+      - lane_turn_class: Optional[int] in {0,2,5} if map strongly says left/right/uturn
+    """
+    has_intersection = False
+    has_roundabout = False
+    lane_turn_class: Optional[int] = None
+
+    for lane in lanes:
+        # Intersection / junction flags (varies by devkit)
+        if bool(getattr(lane, "is_intersection", False)) or bool(getattr(lane, "in_junction", False)):
+            has_intersection = True
+
+        # Roadblock / lane group roundabout flags if present
+        rb = getattr(lane, "roadblock", None)
+        if rb is not None and bool(getattr(rb, "is_roundabout", False)):
+            has_roundabout = True
+
+        # Some versions have lane_group metadata
+        lane_group = getattr(lane, "lane_group", None)
+        if lane_group is not None:
+            lg_type = str(getattr(lane_group, "type", "")).lower()
+            if "roundabout" in lg_type:
+                has_roundabout = True
+
+        # Turn direction / connector type if present
+        # (Important: we only use it if it is explicit)
+        turn_dir = str(getattr(lane, "turn_direction", "")).lower()
+        if not turn_dir:
+            # some versions use turn_type or lane_connector_type
+            turn_dir = str(getattr(lane, "turn_type", "")).lower()
+        if not turn_dir:
+            turn_dir = str(getattr(lane, "lane_connector_type", "")).lower()
+
+        if "left" in turn_dir:
+            lane_turn_class = 0
+        elif "right" in turn_dir:
+            lane_turn_class = 2
+        elif "uturn" in turn_dir or "u_turn" in turn_dir or "u-turn" in turn_dir:
+            lane_turn_class = 5
+
+    return has_intersection, has_roundabout, lane_turn_class
+
+
+def map_based_scene_flags(scenario, xs: np.ndarray, ys: np.ndarray, step: int = 5) -> Tuple[bool, bool, Optional[int]]:
+    lanes = get_lane_objects_along_trajectory(scenario, xs, ys, step=step)
+    if not lanes:
+        return False, False, None
+    return map_based_flags_from_lanes(lanes)
+
+
+# --------------------------------------------------------------------------------------
+# Stage 3: geometry + map fallback (FIXED)
+# --------------------------------------------------------------------------------------
+def classify_emoe_from_map_and_geometry(
+    xs: np.ndarray,
+    ys: np.ndarray,
+    headings: np.ndarray,
+    scenario,
+    tags: List[str],
+    map_step: int = 5,
+) -> Tuple[int, str, Dict[str, Any]]:
+    """
+    Returns:
+      (class_id, stage_name, debug_dict)
+    """
+    T = len(xs)
+    if T < 3:
+        return 6, "stage3_short", {"T": T}
+
+    dx = float(xs[-1] - xs[0])
+    dy = float(ys[-1] - ys[0])
+    dist = float(math.hypot(dx, dy))
+
+    h0 = float(headings[0])
+    hT = float(headings[-1])
+    delta_heading = wrap_to_pi(hT - h0)
+    abs_dh = abs(delta_heading)
+
+    dh = np.diff(headings)
+    dh = np.vectorize(wrap_to_pi)(dh)
+    total_abs = float(np.sum(np.abs(dh)))
+
+    # Stage 2 map hints
+    has_intersection_map, has_roundabout_map, lane_turn_class = map_based_scene_flags(scenario, xs, ys, step=map_step)
+
+    # Tag-based intersection hint
+    has_intersection = bool(has_intersection_map or tag_intersection_hint(getattr(scenario, "scenario_type", ""), tags))
+
+    debug = {
+        "dist": dist,
+        "delta_heading_rad": float(delta_heading),
+        "delta_heading_deg": float(math.degrees(delta_heading)),
+        "abs_delta_heading_deg": float(math.degrees(abs_dh)),
+        "total_abs_heading_deg": float(math.degrees(total_abs)),
+        "has_intersection_map": bool(has_intersection_map),
+        "has_roundabout_map": bool(has_roundabout_map),
+        "lane_turn_class": lane_turn_class if lane_turn_class is not None else -1,
+        "has_intersection_used": bool(has_intersection),
+    }
+
+    # Motion gate (prevents stationary becoming turns)
+    if dist < MIN_DIST_ANY:
+        return 6, "stage3_motion_gate", debug
+
+    # Roundabout: map wins
+    if has_roundabout_map:
+        return 4, "stage2_map", debug
+
+    # Explicit lane connector semantics (if available)
+    if lane_turn_class in (0, 2, 5):
+        return int(lane_turn_class), "stage2_map", debug
+
+    # U-turn: geometry
+    if abs(abs_dh - UTURN_CENTER) < UTURN_MARGIN:
+        return 5, "stage3_geometry", debug
+
+    # Roundabout fallback: geometry (rare; keep as fallback only)
+    if total_abs > ROUNDABOUT_TOTAL_MIN and abs_dh < ROUNDABOUT_NET_MAX:
+        return 4, "stage3_geometry", debug
+
+    # Intersection logic: rely primarily on NET heading
+    if has_intersection:
+        # If ego didn't move enough, do NOT call it a turn (heading jitter otherwise)
+        if dist < MIN_DIST_TURN_AT_INTERSECTION:
+            if abs_dh <= NET_STRAIGHT_MAX_AT_INTERSECTION:
+                return 1, "stage3_intersection_net_heading", debug
+            return 6, "stage3_intersection_motion_guard", debug
+
+        # Straight through intersection
+        if abs_dh <= NET_STRAIGHT_MAX_AT_INTERSECTION:
+            return 1, "stage3_intersection_net_heading", debug
+
+        # Turn at intersection
+        if NET_TURN_MIN_AT_INTERSECTION <= abs_dh <= NET_TURN_MAX_AT_INTERSECTION:
+            return (0 if delta_heading > 0.0 else 2), "stage3_intersection_net_heading", debug
+
+        return 6, "stage3_intersection_fallback", debug
+
+    # Non-intersection: classify straight vs others (no left/right from curvature)
+    straight_net_max = math.radians(15.0)
+    straight_total_max = math.radians(25.0)
+    if abs_dh <= straight_net_max and total_abs <= straight_total_max:
+        return 3, "stage3_nonintersection_straight", debug
+
+    return 6, "stage3_nonintersection_other", debug
+
+
+# --------------------------------------------------------------------------------------
+# Combined classification pipeline
+# --------------------------------------------------------------------------------------
+def classify_emoe_for_scenario(scenario, map_step: int = 5) -> Tuple[int, str, Dict[str, Any]]:
+    """
+    Stage 1: tags/strings priority
+    Stage 2+3: map + geometry verification
+    """
+    scenario_type = getattr(scenario, "scenario_type", "")
+    tags = get_scenario_tags_if_available(scenario)
+
+    # Stage 1
+    emoe_id, stage = stage1_from_tags_and_type(scenario_type, tags)
+    if emoe_id is not None:
+        return int(emoe_id), str(stage), {"scenario_type": scenario_type, "tags": tags}
+
+    # Stage 2+3
+    xs, ys, hs = compute_ego_xyh(scenario)
+    emoe_id, stage, debug = classify_emoe_from_map_and_geometry(xs, ys, hs, scenario, tags, map_step=map_step)
+    debug = dict(debug)
+    debug["scenario_type"] = scenario_type
+    debug["tags"] = tags
+    return int(emoe_id), stage, debug
+
+
+# --------------------------------------------------------------------------------------
+# nuPlan scenario loading
+# --------------------------------------------------------------------------------------
+def build_scenarios(split: str, max_scenarios: int, num_workers: int) -> List[Any]:
+    """
+    Build nuPlan scenarios using ScenarioFilter + SingleMachineParallelExecutor.
+    Assumes NUPLAN_DATA_ROOT and NUPLAN_MAPS_ROOT are set.
+    """
+    data_root = os.environ["NUPLAN_DATA_ROOT"]
+    map_root = os.environ["NUPLAN_MAPS_ROOT"]
 
     db_root = Path(data_root) / "nuplan-v1.1" / "splits" / split
     if not db_root.exists():
         raise FileNotFoundError(f"Cannot find DB at {db_root}")
 
-    worker = SingleMachineParallelExecutor(use_process_pool=False, num_workers=max_workers)
+    worker = SingleMachineParallelExecutor(
+        use_process_pool=False,
+        num_workers=num_workers,
+    )
 
-    # IMPORTANT: ScenarioFilter limit_total_scenarios is not always a strict cap.
-    # We'll slice the returned list in main().
     scenario_filter = ScenarioFilter(
         scenario_types=None,
         log_names=None,
         map_names=None,
         num_scenarios=None,
-        limit_total_scenarios=None,
+        limit_total_scenarios=None if max_scenarios < 0 else max_scenarios,
     )
 
     builder = NuPlanScenarioBuilder(
@@ -150,465 +452,26 @@ def build_scenarios(split: str, max_workers: int = 8) -> List[Any]:
         db_files=None,
         map_version="nuplan-maps-v1.0",
         include_cameras=False,
-        max_workers=max_workers,
+        max_workers=num_workers,
     )
 
     scenarios = builder.get_scenarios(scenario_filter, worker)
     return scenarios
 
 
-# ------------------------------------------------------------
-# Tag parsing (direct overrides + priors)
-# ------------------------------------------------------------
-def tag_direct_override(stype: str) -> Optional[Tuple[int, str]]:
-    """
-    Direct classification from tags.
-    Returns (class_id, stage) or None.
-    """
-    s = stype.upper()
-
-    # Direct roundabout
-    if "ROUNDABOUT" in s:
-        return 4, "TAG_DIRECT_ROUNDABOUT"
-
-    # Direct U-turn
-    if "UTURN" in s or "U_TURN" in s or "U-TURN" in s:
-        return 5, "TAG_DIRECT_UTURN"
-
-    # Direct right turn tags (you requested)
-    # Keep it strict to avoid accidental matches
-    if "STARTING_RIGHT_TURN" in s or "STARTING_RIGHT_TURNS" in s:
-        return 2, "TAG_DIRECT_RIGHT_TURN"
-
-    return None
-
-
-def tag_turn_prior(stype: str) -> Optional[str]:
-    """
-    Weak priors used only for ambiguity resolution.
-    Returns one of: 'LEFT', 'RIGHT', 'STRAIGHT' or None.
-    """
-    s = stype.upper()
-    # cross vs noncross heuristics (weak, dataset dependent)
-    if "_CROSS_TURN" in s and "NONCROSS" not in s:
-        return "LEFT"
-    if "NONCROSS_TURN" in s:
-        return "RIGHT"
-    if "TRAVERSING_INTERSECTION" in s or "TRAVERSING_TRAFFIC_LIGHT_INTERSECTION" in s:
-        return "STRAIGHT"
-    return None
-
-
-# ------------------------------------------------------------
-# Map probing helpers (LANE_CONNECTOR layer)
-# ------------------------------------------------------------
-def get_lane_connector_gdf(map_api):
-    """
-    Load lane connector vector layer (GeoDataFrame).
-    Uses private API like your probing scripts, since it works in your setup.
-    """
-    try:
-        return map_api._get_vector_map_layer(SemanticMapLayer.LANE_CONNECTOR)  # type: ignore[attr-defined]
-    except Exception:
-        return None
-
-
-def nearest_connector_votes_along_trajectory(
-    conn_gdf,
-    xs: np.ndarray,
-    ys: np.ndarray,
-    step: int = 5,
-    max_dist_m: float = 5.0,
-    window_radius_m: float = 80.0,
-) -> Tuple[bool, Counter]:
-    """
-    Along the ego trajectory, sample every `step` frames and query nearest lane connector.
-    Returns:
-      - has_intersection: True if any matched connector has intersection_fid non-null
-      - votes: Counter over connector turn types (strings) INCLUDING 'NONE'
-              turn_type_fid mapping: 0 STRAIGHT, 1 LEFT, 2 RIGHT, 3 UTURN, 4 UNKNOWN
-    """
-    votes = Counter()
-    has_intersection = False
-
-    if conn_gdf is None or len(conn_gdf) == 0:
-        votes["NONE"] += int(math.ceil(len(xs) / max(1, step)))
-        return False, votes
-
-    # Require columns we need
-    if "geometry" not in conn_gdf.columns:
-        votes["NONE"] += int(math.ceil(len(xs) / max(1, step)))
-        return False, votes
-
-    # Determine which columns exist
-    has_turn = "turn_type_fid" in conn_gdf.columns
-    has_inter = "intersection_fid" in conn_gdf.columns
-
-    # Local window to keep the candidate set smaller
-    cx = float(np.mean(xs))
-    cy = float(np.mean(ys))
-    minx, maxx = cx - window_radius_m, cx + window_radius_m
-    miny, maxy = cy - window_radius_m, cy + window_radius_m
-    try:
-        local = conn_gdf.cx[minx:maxx, miny:maxy]
-    except Exception:
-        local = conn_gdf
-
-    if local is None or len(local) == 0:
-        votes["NONE"] += int(math.ceil(len(xs) / max(1, step)))
-        return False, votes
-
-    # Spatial index nearest query (fast) if available
-    try:
-        sindex = local.sindex
-    except Exception:
-        sindex = None
-
-    # Lazy import shapely Point
-    from shapely.geometry import Point
-
-    def turn_label_from_val(val) -> str:
-        if not has_turn:
-            return "UNKNOWN"
-        try:
-            if val is None or (isinstance(val, float) and math.isnan(val)):
-                return "UNKNOWN"
-            iv = int(val)
-        except Exception:
-            return "UNKNOWN"
-        if iv == 0:
-            return "STRAIGHT"
-        if iv == 1:
-            return "LEFT"
-        if iv == 2:
-            return "RIGHT"
-        if iv == 3:
-            return "UTURN"
-        return "UNKNOWN"
-
-    def has_intersection_from_row(row) -> bool:
-        if not has_inter:
-            return False
-        v = row.get("intersection_fid", None)
-        if v is None:
-            return False
-        try:
-            if isinstance(v, float) and math.isnan(v):
-                return False
-        except Exception:
-            pass
-        return True
-
-    # Sample trajectory
-    for i in range(0, len(xs), step):
-        p = Point(float(xs[i]), float(ys[i]))
-
-        best_row = None
-        best_dist = max_dist_m
-
-        if sindex is not None:
-            # nearest returns candidate indices; we still check exact distance
-            try:
-                # geopandas sindex.nearest returns generator/array depending on version
-                nearest_idx = list(sindex.nearest(p.bounds, return_all=False))[0]
-                row = local.iloc[int(nearest_idx)]
-                d = float(row.geometry.distance(p))
-                if d <= best_dist:
-                    best_dist = d
-                    best_row = row
-            except Exception:
-                best_row = None
-
-        # Fallback: brute check only local (still smaller than full)
-        if best_row is None:
-            try:
-                # compute distances vectorized-ish
-                dists = local.geometry.distance(p)
-                j = int(dists.values.argmin())
-                d = float(dists.values[j])
-                if d <= best_dist:
-                    best_dist = d
-                    best_row = local.iloc[j]
-            except Exception:
-                best_row = None
-
-        if best_row is None:
-            votes["NONE"] += 1
-            continue
-
-        # Vote
-        tl = turn_label_from_val(best_row.get("turn_type_fid", None))
-        votes[tl] += 1
-
-        # Intersection context
-        if has_intersection_from_row(best_row):
-            has_intersection = True
-
-    return has_intersection, votes
-
-
-def connector_tiebreak_label(votes: Counter) -> Optional[str]:
-    """
-    Return best connector label among {LEFT, RIGHT, STRAIGHT, UTURN, UNKNOWN},
-    IGNORING NONE entirely. If no evidence, return None.
-    """
-    candidates = ["LEFT", "RIGHT", "STRAIGHT", "UTURN", "UNKNOWN"]
-    best = None
-    best_count = 0
-    for k in candidates:
-        c = int(votes.get(k, 0))
-        if c > best_count:
-            best_count = c
-            best = k
-    return best if best_count > 0 else None
-
-
-# ------------------------------------------------------------
-# Geometry-based maneuver classification
-# ------------------------------------------------------------
-def geometry_stats(xs: np.ndarray, ys: np.ndarray, hs: np.ndarray) -> Dict[str, float]:
-    """
-    Compute geometry stats used for classification.
-    """
-    if len(xs) < 2:
-        return {"dist": 0.0, "dh_deg": 0.0, "total_abs_deg": 0.0, "pos_deg": 0.0, "neg_deg": 0.0}
-
-    dx = float(xs[-1] - xs[0])
-    dy = float(ys[-1] - ys[0])
-    dist = float(math.hypot(dx, dy))
-
-    dh = wrap_to_pi(float(hs[-1] - hs[0]))
-    dh_deg = float(math.degrees(dh))
-
-    dhs = np.diff(hs)
-    # wrap each step
-    dհ = np.array([wrap_to_pi(float(a)) for a in dhs], dtype=np.float64)
-    total_abs = float(np.sum(np.abs(dհ)))
-    pos = float(np.sum(np.clip(dհ, 0.0, None)))
-    neg = -float(np.sum(np.clip(dհ, None, 0.0)))
-
-    return {
-        "dist": dist,
-        "dh_deg": dh_deg,
-        "total_abs_deg": float(math.degrees(total_abs)),
-        "pos_deg": float(math.degrees(pos)),
-        "neg_deg": float(math.degrees(neg)),
-    }
-
-
-def geometry_maneuver_label(stats: Dict[str, float]) -> Tuple[str, bool]:
-    """
-    Decide maneuver from geometry.
-    Returns (label, is_ambiguous)
-
-    label in:
-      STRAIGHT, LEFT, RIGHT, UTURN, ROUNDABOUT, OTHER
-    """
-    dist = stats["dist"]
-    dh = stats["dh_deg"]
-    abs_dh = abs(dh)
-    total_abs = stats["total_abs_deg"]
-    pos = stats["pos_deg"]
-    neg = stats["neg_deg"]
-
-    # distance filter
-    if dist < 5.0:
-        return "OTHER", True
-
-    # thresholds (tune later if needed)
-    straight_net_max = 15.0
-    straight_total_max = 25.0
-
-    turn_net_min = 25.0
-    turn_net_max = 155.0
-
-    uturn_center = 180.0
-    uturn_margin = 35.0
-
-    roundabout_total_min = 270.0
-    roundabout_net_max = 90.0
-
-    # U-turn-like
-    if abs(abs_dh - uturn_center) < uturn_margin:
-        return "UTURN", False
-
-    # Roundabout-like
-    if total_abs >= roundabout_total_min and abs_dh <= roundabout_net_max:
-        return "ROUNDABOUT", False
-
-    # Straight-like
-    if abs_dh <= straight_net_max and total_abs <= straight_total_max:
-        return "STRAIGHT", False
-
-    # Left/Right-like
-    if turn_net_min <= abs_dh <= turn_net_max:
-        if pos >= neg:
-            return "LEFT", False
-        else:
-            return "RIGHT", False
-
-    # Ambiguous region (gentle curves / weird cases)
-    # If it has substantial turning but not cleanly a turn class:
-    if total_abs > 40.0:
-        # pick direction by dominance but mark ambiguous
-        if pos > neg:
-            return "LEFT", True
-        elif neg > pos:
-            return "RIGHT", True
-        else:
-            return "OTHER", True
-
-    return "OTHER", True
-
-
-# ------------------------------------------------------------
-# Final classification (stages)
-# ------------------------------------------------------------
-def classify_emoe_scenario(
-    scenario,
-    conn_gdf,
-    connector_step: int,
-    connector_max_dist_m: float,
-    connector_window_radius_m: float,
-) -> Tuple[int, str, Dict[str, Any]]:
-    """
-    Returns:
-      (emoe_class_id, stage, debug_dict)
-    """
-    stype = scenario.scenario_type
-
-    # Stage 1: direct tag overrides
-    direct = tag_direct_override(stype)
-    if direct is not None:
-        cid, stage = direct
-        return cid, stage, {"scenario_type": stype}
-
-    # Extract geometry
-    xs, ys, hs = compute_ego_xyh(scenario)
-    stats = geometry_stats(xs, ys, hs)
-    geom_label, geom_amb = geometry_maneuver_label(stats)
-
-    # Connector votes + intersection context via intersection_fid
-    has_intersection, votes = nearest_connector_votes_along_trajectory(
-        conn_gdf,
-        xs,
-        ys,
-        step=connector_step,
-        max_dist_m=connector_max_dist_m,
-        window_radius_m=connector_window_radius_m,
-    )
-    conn_hint = connector_tiebreak_label(votes)  # ignores NONE
-
-    # Special cases from geometry if tags did not catch
-    if geom_label == "ROUNDABOUT":
-        return 4, "GEOMETRY_SPECIAL_ROUNDABOUT", {
-            "scenario_type": stype, **stats,
-            "has_intersection": bool(has_intersection),
-            "connector_hint": conn_hint, "connector_votes": dict(votes),
-        }
-    if geom_label == "UTURN":
-        return 5, "GEOMETRY_SPECIAL_UTURN", {
-            "scenario_type": stype, **stats,
-            "has_intersection": bool(has_intersection),
-            "connector_hint": conn_hint, "connector_votes": dict(votes),
-        }
-
-    # Intersection context used for EMoE semantics
-    context = "INTERSECTION" if has_intersection else "NON_INTERSECTION"
-
-    # If geometry confident, decide immediately
-    if not geom_amb:
-        if geom_label == "STRAIGHT":
-            cid = 1 if context == "INTERSECTION" else 3
-            return cid, "GEOMETRY_MAP", {
-                "scenario_type": stype, **stats,
-                "has_intersection": bool(has_intersection),
-                "connector_hint": conn_hint, "connector_votes": dict(votes),
-            }
-        if geom_label == "LEFT":
-            cid = 0 if context == "INTERSECTION" else 6
-            return cid, "GEOMETRY_MAP", {
-                "scenario_type": stype, **stats,
-                "has_intersection": bool(has_intersection),
-                "connector_hint": conn_hint, "connector_votes": dict(votes),
-            }
-        if geom_label == "RIGHT":
-            cid = 2 if context == "INTERSECTION" else 6
-            return cid, "GEOMETRY_MAP", {
-                "scenario_type": stype, **stats,
-                "has_intersection": bool(has_intersection),
-                "connector_hint": conn_hint, "connector_votes": dict(votes),
-            }
-        # OTHER
-        return 6, "GEOMETRY_MAP", {
-            "scenario_type": stype, **stats,
-            "has_intersection": bool(has_intersection),
-            "connector_hint": conn_hint, "connector_votes": dict(votes),
-        }
-
-    # Stage 3: ambiguity resolution (use priors + connector hint)
-    prior = tag_turn_prior(stype)
-
-    # decide direction among LEFT/RIGHT/STRAIGHT from best evidence
-    decision = None
-
-    # 1) if connector hint provides direction
-    if conn_hint in ("LEFT", "RIGHT", "STRAIGHT"):
-        decision = conn_hint
-        stage = "AMBIG_TIEBREAK_CONNECTOR"
-    # 2) else use tag prior
-    elif prior in ("LEFT", "RIGHT", "STRAIGHT"):
-        decision = prior
-        stage = "AMBIG_TIEBREAK_TAG"
-    # 3) else fallback to geometry label if it at least picked a direction
-    elif geom_label in ("LEFT", "RIGHT", "STRAIGHT"):
-        decision = geom_label
-        stage = "AMBIG_FALLBACK_GEOMETRY"
-    else:
-        decision = "OTHER"
-        stage = "FALLBACK_OTHERS"
-
-    if decision == "STRAIGHT":
-        cid = 1 if context == "INTERSECTION" else 3
-    elif decision == "LEFT":
-        cid = 0 if context == "INTERSECTION" else 6
-    elif decision == "RIGHT":
-        cid = 2 if context == "INTERSECTION" else 6
-    else:
-        cid = 6
-
-    return cid, stage, {
-        "scenario_type": stype, **stats,
-        "has_intersection": bool(has_intersection),
-        "geom_label": geom_label,
-        "connector_hint": conn_hint,
-        "tag_prior": prior,
-        "connector_votes": dict(votes),
-    }
-
-
-# ------------------------------------------------------------
-# Main
-# ------------------------------------------------------------
+# --------------------------------------------------------------------------------------
+# Main: generate scene_labels.jsonl + scene_anchors.npy
+# --------------------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--split", type=str, default="mini")
-    parser.add_argument("--output_dir", type=str, required=True)
-    parser.add_argument("--Ka", type=int, default=24)
-    parser.add_argument("--max_scenarios", type=int, default=20000,
-                        help="Hard cap on scenarios processed. Set -1 for all (not recommended).")
-
-    # connector sampling / matching
-    parser.add_argument("--connector_step", type=int, default=5,
-                        help="Sample every N frames for connector queries.")
-    parser.add_argument("--connector_max_dist_m", type=float, default=5.0,
-                        help="Max distance to accept nearest connector as 'hit'.")
-    parser.add_argument("--connector_window_radius_m", type=float, default=80.0,
-                        help="Local window radius around ego mean for connector layer cropping.")
-
-    # include endpoints only if traveled enough
-    parser.add_argument("--min_travel_distance_m", type=float, default=5.0)
-
+    parser.add_argument("--split", type=str, default="mini", help="nuPlan split: mini, trainval, etc.")
+    parser.add_argument("--output_dir", type=str, required=True, help="Output directory for labels + anchors")
+    parser.add_argument("--Ka", type=int, default=24, help="Anchors per class (KMeans clusters)")
+    parser.add_argument("--max_scenarios", type=int, default=-1, help="Limit number of scenarios (-1 = all)")
+    parser.add_argument("--num_workers", type=int, default=8, help="Worker threads for scenario loading")
+    parser.add_argument("--map_step", type=int, default=5, help="Subsample step for map queries along trajectory")
+    parser.add_argument("--min_travel_distance", type=float, default=5.0, help="Min travel dist to include in anchors")
+    parser.add_argument("--kmeans_seed", type=int, default=0, help="Random seed for KMeans")
     args = parser.parse_args()
 
     out_dir = Path(args.output_dir).expanduser().resolve()
@@ -620,136 +483,116 @@ def main():
     print(f"[INFO] output_dir={out_dir}")
     print(f"[INFO] Ka={args.Ka}")
     print(f"[INFO] max_scenarios={args.max_scenarios}")
+    print(f"[INFO] map_step={args.map_step}")
+    print(f"[INFO] min_travel_distance(for anchors)={args.min_travel_distance}")
 
-    print("[INFO] Loading scenarios ...")
-    scenarios = build_scenarios(args.split, max_workers=8)
-    print(f"[INFO] Loaded {len(scenarios)} scenarios total (before hard cap).")
+    print(f"[INFO] Loading scenarios...")
+    scenarios = build_scenarios(args.split, args.max_scenarios, args.num_workers)
+    print(f"[INFO] Loaded {len(scenarios)} scenarios.")
 
-    if args.max_scenarios is not None and args.max_scenarios > 0:
-        scenarios = scenarios[: args.max_scenarios]
-        print(f"[INFO] Restricting processing to first {len(scenarios)} scenarios (hard cap).")
-    elif args.max_scenarios == -1:
-        print("[WARN] max_scenarios=-1, processing ALL loaded scenarios (may take a long time).")
-
-    # We will lazily load connector layer from first scenario's map_api.
-    # (All scenarios in a map should share the same schema.)
-    conn_gdf = None
-    try:
-        conn_gdf = get_lane_connector_gdf(scenarios[0].map_api)
-    except Exception:
-        conn_gdf = None
-    print(f"[INFO] Lane connector layer loaded: {conn_gdf is not None} (rows={0 if conn_gdf is None else len(conn_gdf)})")
-    if conn_gdf is not None:
-        cols = list(conn_gdf.columns)
-        print(f"[INFO] LANE_CONNECTOR columns include: intersection_fid={'intersection_fid' in cols}, turn_type_fid={'turn_type_fid' in cols}")
-
-    # Stats containers
+    endpoints_by_class: Dict[int, List[np.ndarray]] = defaultdict(list)
     class_counts = Counter()
     stage_counts = Counter()
-    endpoints_by_class: Dict[int, List[np.ndarray]] = defaultdict(list)
 
-    # Write labels
-    n_written = 0
-    with labels_path.open("w") as f:
-        for scenario in tqdm(scenarios, desc="Classifying scenarios"):
-            try:
-                cid, stage, debug = classify_emoe_scenario(
-                    scenario,
-                    conn_gdf,
-                    connector_step=args.connector_step,
-                    connector_max_dist_m=args.connector_max_dist_m,
-                    connector_window_radius_m=args.connector_window_radius_m,
-                )
-            except Exception as e:
-                # If something goes wrong, dump to others
-                cid, stage, debug = 6, "EXCEPTION_FALLBACK", {"error": str(e), "scenario_type": getattr(scenario, "scenario_type", "UNKNOWN")}
+    # Write labels streaming to disk (so you don’t lose everything if interrupted)
+    f_labels = labels_path.open("w")
 
-            class_counts[cid] += 1
+    try:
+        for scenario in tqdm(scenarios, desc="Classifying + collecting endpoints"):
+            token = scenario.token
+
+            # classify
+            emoe_id, stage, debug = classify_emoe_for_scenario(scenario, map_step=args.map_step)
+            class_counts[emoe_id] += 1
             stage_counts[stage] += 1
 
-            # endpoint collection for anchors (only if traveled enough)
-            try:
-                xs, ys, hs = compute_ego_xyh(scenario)
-                # travel distance check
-                dist = float(math.hypot(float(xs[-1] - xs[0]), float(ys[-1] - ys[0]))) if len(xs) > 1 else 0.0
-                if dist >= args.min_travel_distance_m:
-                    ep = endpoint_in_initial_ego_frame(xs, ys, hs)
-                    endpoints_by_class[cid].append(ep)
-            except Exception:
-                pass
+            # compute endpoint for anchors (use GT endpoint only, as in paper)
+            xs, ys, hs = compute_ego_xyh(scenario)
+            if len(xs) >= 2:
+                dist = float(math.hypot(float(xs[-1] - xs[0]), float(ys[-1] - ys[0])))
+            else:
+                dist = 0.0
 
+            if dist >= float(args.min_travel_distance):
+                endpoint_xy = ego_endpoint_in_ego_frame(xs, ys, hs)
+                endpoints_by_class[emoe_id].append(endpoint_xy)
+
+            # write record
             record = {
-                "token": scenario.token,
-                "emoe_class_id": int(cid),
-                "emoe_class_name": EMOE_SCENE_TYPES[int(cid)],
+                "token": token,
+                "emoe_class_id": int(emoe_id),
+                "emoe_class_name": EMOE_SCENE_TYPES[int(emoe_id)],
+                "scenario_type": getattr(scenario, "scenario_type", ""),
                 "stage": stage,
-                **debug,
+                "travel_distance_m": float(dist),
+                # keep debug but lightweight
+                "debug": {
+                    k: debug[k]
+                    for k in [
+                        "dist",
+                        "delta_heading_deg",
+                        "abs_delta_heading_deg",
+                        "total_abs_heading_deg",
+                        "has_intersection_map",
+                        "has_roundabout_map",
+                        "lane_turn_class",
+                        "has_intersection_used",
+                        "scenario_type",
+                        "tags",
+                    ]
+                    if k in debug
+                },
             }
-            f.write(json.dumps(record) + "\n")
-            n_written += 1
+            f_labels.write(json.dumps(record) + "\n")
 
-    print(f"\n[INFO] Wrote labels for {n_written} scenarios -> {labels_path}")
+    finally:
+        f_labels.close()
 
-    # Print stats: per class
-    print("\n[STATS] Scenarios per EMoE class:")
-    total = sum(class_counts.values())
-    for c in range(len(EMOE_SCENE_TYPES)):
-        n = class_counts.get(c, 0)
-        pct = 100.0 * n / max(1, total)
-        print(f"  {c} {EMOE_SCENE_TYPES[c]:28s}: {n:8d} ({pct:5.2f}%)")
+    print("\n[INFO] Scenario counts per class:")
+    for c in range(7):
+        print(f"  class {c} ({EMOE_SCENE_TYPES[c]:28s}): {class_counts[c]}")
 
-    # Print stats: per stage
-    print("\n[STATS] Scenarios per decision stage:")
+    print("\n[INFO] Scenario counts per stage:")
     for k, v in stage_counts.most_common():
-        pct = 100.0 * v / max(1, total)
-        print(f"  {k:28s}: {v:8d} ({pct:5.2f}%)")
+        print(f"  {k:32s}: {v}")
 
-    # Endpoint stats (for anchors)
-    print("\n[STATS] Endpoints collected per class (for anchor clustering):")
-    for c in range(len(EMOE_SCENE_TYPES)):
-        n = len(endpoints_by_class.get(c, []))
-        print(f"  {c} {EMOE_SCENE_TYPES[c]:28s}: {n:8d} endpoints")
+    print("\n[INFO] Endpoint counts per class (for anchor clustering):")
+    for c in range(7):
+        print(f"  class {c} ({EMOE_SCENE_TYPES[c]:28s}): {len(endpoints_by_class[c])} endpoints")
 
-    # ------------------------------------------------------------
-    # KMeans anchors per class (endpoints only)
-    # ------------------------------------------------------------
-    num_classes = len(EMOE_SCENE_TYPES)
+    # KMeans per class -> anchors
     Ka = int(args.Ka)
-    scene_anchors = np.zeros((num_classes, Ka, 2), dtype=np.float32)
+    scene_anchors = np.zeros((7, Ka, 2), dtype=np.float32)
 
-    print("\n[INFO] Running MiniBatchKMeans per class to compute anchors ...")
-    for c in range(num_classes):
-        pts = np.asarray(endpoints_by_class.get(c, []), dtype=np.float32)  # [N,2]
-        npts = int(pts.shape[0])
-
-        if npts == 0:
-            print(f"  [WARN] Class {c} has 0 endpoints. Anchors remain zeros.")
+    print("\n[INFO] Running KMeans per class (endpoints only)...")
+    for c in range(7):
+        pts = np.asarray(endpoints_by_class[c], dtype=np.float32)  # [N,2]
+        if pts.shape[0] == 0:
+            print(f"[WARN] No endpoints for class {c} ({EMOE_SCENE_TYPES[c]}). Anchors stay zeros.")
             continue
 
-        k = min(Ka, npts)
-        kmeans = MiniBatchKMeans(
-            n_clusters=k,
-            random_state=0,
-            batch_size=4096,
-            n_init="auto" if hasattr(MiniBatchKMeans, "n_init") else 10,
+        n_clusters = min(Ka, pts.shape[0])
+        kmeans = KMeans(
+            n_clusters=n_clusters,
+            random_state=int(args.kmeans_seed),
+            n_init="auto" if hasattr(KMeans, "n_init") else 10,
         )
         kmeans.fit(pts)
-        centers = kmeans.cluster_centers_.astype(np.float32)  # [k,2]
+        centers = kmeans.cluster_centers_.astype(np.float32)
 
-        scene_anchors[c, :k, :] = centers
-        if k < Ka:
-            # fill remaining by repeating first center (deterministic)
-            scene_anchors[c, k:, :] = centers[:1, :]
+        scene_anchors[c, :n_clusters, :] = centers
 
-        print(f"  [INFO] Class {c} ({EMOE_SCENE_TYPES[c]}): {npts} pts -> {k} clusters")
+        # pad if fewer points than Ka
+        if n_clusters < Ka:
+            reps = Ka - n_clusters
+            scene_anchors[c, n_clusters:, :] = np.repeat(centers[:1, :], reps, axis=0)
+
+        print(f"  class {c} ({EMOE_SCENE_TYPES[c]:28s}): {pts.shape[0]} pts -> {n_clusters} clusters")
 
     np.save(anchors_path, scene_anchors)
-    print(f"\n[INFO] Saved anchors -> {anchors_path}")
-    print(f"[INFO] scene_anchors shape: {scene_anchors.shape}  (7, Ka, 2)")
-
-    print("\n[DONE] Outputs:")
-    print(f"  - {labels_path}")
-    print(f"  - {anchors_path}")
+    print(f"\n[INFO] Saved anchors to: {anchors_path}  shape={scene_anchors.shape}")
+    print(f"[INFO] Saved labels to:  {labels_path}")
+    print("\n[DONE]")
 
 
 if __name__ == "__main__":
