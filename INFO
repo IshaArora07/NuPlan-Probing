@@ -1,0 +1,289 @@
+Slide 1 — Goal and Outputs (What we are building)
+
+Goal: Precompute a clean, explainable scene-class label for every nuPlan scenario and compute class-specific anchor endpoints for EMoE planning.
+
+Inputs (per scenario):
+	•	Ego trajectory: rear-axle (x, y, heading) over time
+	•	nuPlan scenario metadata: scenario_type / tags (when available)
+	•	HD map: SemanticMapLayer vector layers (GeoDataFrames)
+
+Outputs:
+	•	scene_labels.jsonl
+	•	1 record per scenario: token → emoe_class_id + class_name + stage + debug
+	•	scene_anchors.npy
+	•	shape [7, Ka, 2]
+	•	anchors = KMeans cluster centers on GT endpoint in ego frame per class
+
+EMoE Classes (7):
+0. left_turn_at_intersection
+	1.	straight_at_intersection
+	2.	right_turn_at_intersection
+	3.	straight_non_intersection
+	4.	roundabout
+	5.	u_turn
+	6.	others
+
+⸻
+
+Slide 2 — Why a staged classifier (key design idea)
+
+We use a multi-stage priority pipeline because any single signal is unreliable:
+	•	Tags can be missing or noisy → good for high-precision “obvious” cases
+	•	Map semantics can miss intersections depending on polygon coverage → good for robust intersection context
+	•	Geometry (net heading) is highly reliable for direction, but only when:
+	•	ego actually moved enough
+	•	intersection context is known
+
+Core principle:
+✅ Use tags / map to decide “intersection context”
+✅ Use geometry to decide left vs right vs straight (direction)
+
+⸻
+
+Slide 3 — High-level flowchart (priority order)
+
+Step A: Tag Priority (high precision, cheap)
+	•	If tag indicates roundabout → class 4 (roundabout)
+	•	If tag indicates u-turn → class 5 (u_turn)
+	•	If tag indicates starting_right_turn / right_turn → class 2 (right turn at intersection)
+(direct as requested, avoids overthinking obvious labels)
+
+Step B: Determine “Intersection Context”
+	•	If tag indicates intersection → intersection_context = TRUE (tag wins)
+	•	Else use map intersection detection → intersection_context = map result
+
+Step C: Geometry decides direction
+	•	If intersection_context = TRUE:
+	•	net heading decides left/right/straight at intersection (with motion gates)
+	•	Else (non-intersection):
+	•	only classify straight_non_intersection vs others
+	•	do NOT assign left/right based on curvature outside intersection
+
+Step D: Anchors
+	•	Collect ego-frame endpoint (if traveled distance ≥ threshold)
+	•	Run KMeans per class → anchors
+
+⸻
+
+Slide 4 — Stage 1: Tag-based direct classification
+
+Purpose: Fast, high-confidence direct labels for obvious categories.
+Why: Reduces downstream errors and avoids map/geometry ambiguity in these cases.
+
+Rules:
+	•	Roundabout
+	•	If scenario_type contains “ROUNDABOUT” OR tags contain “ROUNDABOUT”
+→ class 4
+	•	U-turn
+	•	If scenario_type contains “UTURN”/“U_TURN” OR tags contain these
+→ class 5
+	•	Right turn (direct)
+	•	If scenario_type or tags contain patterns like:
+	•	STARTING_RIGHT_TURN, RIGHT_TURN
+→ class 2
+	•	Otherwise → proceed to map + geometry stages
+
+Important:
+We do NOT directly label left turns from tags here (left tags are rarer / inconsistent in nuPlan), and we want geometry to decide direction reliably.
+
+⸻
+
+Slide 5 — Stage 2: Intersection detection using SemanticMapLayer.INTERSECTION
+
+Problem we fixed: get_one_lane_or_lane_connector_from_point was unreliable (often returned None / inconsistent).
+Solution: Use the vector map layer directly.
+
+What we use:
+	•	Semantic layer: INTERSECTION polygons (GeoDataFrame)
+
+Method (sample along trajectory):
+For ego points sampled every map_sample_step frames:
+	1.	Create Point(x, y)
+	2.	Query candidate polygons (spatial index if available)
+	3.	Check:
+	•	polygon.contains(point) OR
+	•	distance(point, polygon) ≤ intersection_tol_m
+
+Intersection context is TRUE if:
+	•	any hit OR minimum distance ≤ tolerance
+
+Why this is important:
+	•	Distinguishes intersection vs non-intersection, which is critical because:
+	•	Turns are only labeled as left/right at intersections
+	•	Non-intersection curvature should not be forced into left/right classes
+
+⸻
+
+Slide 6 — Stage 2b: Lane connector “vote” (verification signal)
+
+Purpose: Provide extra evidence that the area is “junction-like” and optionally validate map/geometry decisions.
+
+What we use:
+	•	Semantic layer: LANE_CONNECTOR geometries + turn_type_fid
+	•	Mapping: STRAIGHT=0, LEFT=1, RIGHT=2, UTURN=3, UNKNOWN=4
+
+Method:
+	•	For each sampled ego point:
+	•	find connector geometries within connector_radius_m
+	•	vote their turn types
+	•	Compute:
+	•	counts per type (ignoring NONE when selecting dominant)
+	•	dominant type + ratio
+
+How it is used (conservatively):
+	•	NOT primary for direction (because connectors nearby might not be ego’s chosen connector)
+	•	Used as:
+	•	“junction-like” evidence to avoid false straight_non_intersection
+	•	optional sanity check against net heading direction
+
+Why:
+Connectors represent possible movements in the area, not necessarily ego’s movement.
+
+⸻
+
+Slide 7 — Stage 3: Geometry decision at intersections (crystal-clear thresholds)
+
+Key idea: When intersection context is TRUE, net heading (Δθ) is the best direction signal.
+
+Inputs:
+	•	dist = travel distance between first and last point
+	•	Δθ = wrap_to_pi(heading_end − heading_start)
+	•	|Δθ| = absolute net heading change
+
+Motion gates (avoid stationary false turns):
+	•	If dist < MIN_DIST_ANY (= 5m) → class 6 (others)
+Reason: stationary/jitter can create fake heading changes.
+	•	If dist < MIN_DIST_TURN_AT_INTERSECTION (= 12m):
+	•	If |Δθ| ≤ 12° → class 1 (straight_at_intersection)
+	•	Else → class 6 (others)
+Reason: if ego barely moved, “turn” is likely noise.
+
+Intersection direction rules:
+	•	Straight at intersection: |Δθ| ≤ 12° → class 1
+	•	Turn candidate: 35° ≤ |Δθ| ≤ 165° → left/right by sign:
+	•	if Δθ > 0 → class 0 (left turn at intersection)
+	•	else Δθ < 0 → class 2 (right turn at intersection)
+	•	Otherwise → class 6 (others)
+
+Why these thresholds:
+	•	12° allows minor steering/measurement noise still considered “straight”
+	•	35° minimum reduces false left/right from gentle curves or jitter
+	•	165° maximum avoids confusing near-u-turn behavior with left/right
+
+⸻
+
+Slide 8 — Stage 3: U-turn handling (geometry)
+
+Why special-case: A u-turn is not reliably captured by “left/right turn at intersection” thresholds.
+
+Rule:
+	•	If | |Δθ| − 180° | < 35° → class 5 (u_turn)
+
+Interpretation:
+	•	Net heading close to π radians indicates reversal of direction.
+
+Why it matters:
+	•	Prevents labeling u-turns as extreme left/right turns.
+	•	Gives a clean separate class for EMoE routing and anchor clustering.
+
+⸻
+
+Slide 9 — Stage 3: Non-intersection classification (only straight vs others)
+
+Key rule: If no intersection context, we do NOT output left/right classes.
+
+Reason:
+Many roads curve; curvature ≠ “turn at intersection”.
+Assigning left/right outside intersections creates noisy labels and bad anchors.
+
+Non-intersection straight gate:
+	•	If |Δθ| ≤ 15° and total heading variation Σ|dθ| ≤ 25°
+→ class 3 (straight_non_intersection)
+Else → class 6 (others)
+
+Extra safety (junction-like regions):
+	•	If map says no intersection but connector vote indicates junction-like area
+→ class 6 (others) (conservative)
+Reason: map polygons can be incomplete; don’t mislabel these as straight_non_intersection.
+
+⸻
+
+Slide 10 — How this solves your observed failures (from visualizations)
+
+Observed issue: Scenarios that visually contain an intersection were labeled “straight_non_intersection” or “others”.
+Primary cause: Intersection detection failing when relying on lane queries.
+
+Fixes introduced:
+	•	Switch to SemanticMapLayer.INTERSECTION polygons → more consistent intersection detection
+	•	Add tolerance distance (intersection_tol_m) → handles near-boundary trajectories
+	•	Use connector vote as “junction-like” evidence → reduces false straight_non_intersection
+
+Observed issue: Stationary scenarios labeled as left/right.
+Fixes introduced:
+	•	Motion gate (MIN_DIST_ANY)
+	•	Intersection motion guard (MIN_DIST_TURN_AT_INTERSECTION)
+These prevent net heading jitter from creating turn labels.
+
+⸻
+
+Slide 11 — Anchor generation (KMeans on endpoints per class)
+
+Goal: Create class-specific motion priors (anchors) for EMoE query generation.
+
+Endpoint definition:
+	•	Use GT endpoint in the initial ego frame:
+	•	translate by start position
+	•	rotate by start heading so ego starts facing +x
+
+Collection rule:
+	•	Only include endpoints if travel distance ≥ min_travel_distance (default 5m)
+
+KMeans per class:
+	•	For each class c:
+	•	points: [N_c, 2]
+	•	clusters: min(Ka, N_c)
+	•	centers become anchors: [Ka, 2]
+	•	If N_c < Ka, repeat centers to fill shape
+
+Why:
+Anchors reflect typical endpoint modes per scene type (turn shapes differ by class).
+
+⸻
+
+Slide 12 — Debug and reporting (why we log stages + stats)
+
+We log per scenario:
+	•	stage that classified it (e.g., stage1_tags, stage3_intersection_net_heading)
+	•	debug values:
+	•	distance
+	•	net heading (deg)
+	•	total heading variation (deg)
+	•	intersection_map + min distance to polygon
+	•	connector vote (dominant type, counts, ratio)
+
+Why stage stats matter:
+	•	Helps identify which stage dominates classification
+	•	Quickly reveals failure modes:
+	•	too many “junctiony_no_intersection_polygon” → increase intersection_tol_m or sample more densely
+	•	too many “motion_gate” in turns → thresholds too strict or scenarios are mostly stationary
+
+⸻
+
+Slide 13 — Tunable parameters (what you adjust & why)
+
+Intersection detection:
+	•	intersection_tol_m (default 12m)
+	•	↑ if intersections are missed in visuals
+	•	map_sample_step (default 5 frames)
+	•	↓ to sample more points along trajectory → more robust detection
+
+Turn thresholds:
+	•	NET_TURN_MIN_AT_INTERSECTION (currently 35°)
+	•	↑ reduces false turns, ↓ captures weaker turns
+	•	NET_STRAIGHT_MAX_AT_INTERSECTION (12°)
+	•	↑ classifies more as straight-at-intersection
+
+Motion gates:
+	•	MIN_DIST_ANY (5m)
+	•	MIN_DIST_TURN_AT_INTERSECTION (12m)
+	•	↑ reduces jitter-turns but may push short turns into others
