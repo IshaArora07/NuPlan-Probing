@@ -1,31 +1,33 @@
 #!/usr/bin/env python3
 """
-Unsupervised clustering of nuPlan scenarios using interpretable continuous features
-(trajectory + SemanticMapLayer intersection/connector semantics).
+Unsupervised KMeans analysis + DIRECT visualization of exemplar tokens (in one script).
 
-Adds REVIEW PACK EXPORT:
-  out_dir/review_pack/cluster_XX/
-    - tokens_all.txt
-    - tokens_exemplars.txt
-    - tokens_random.txt
-    - stats.json  (means/stds in original units)
-    - HOW_TO_VISUALIZE.txt  (token-filter snippet for your existing visualizer)
+What this script does:
+  1) Loads scene_labels.jsonl (no re-classification)
+  2) Builds a feature matrix X from the saved "debug" fields (distance, headings, intersection, connector ratios, etc.)
+  3) Runs StandardScaler + KMeans
+  4) Selects exemplar tokens per cluster (closest-to-centroid)
+  5) Scans nuPlan scenarios ONLY until all exemplar tokens are found (hard cap)
+  6) Saves (A) Global map view + (B) Ego-frame view PNGs for each exemplar
+
+Why this matches your request:
+  ✅ Visualization is built-in to the analysis script
+  ✅ Exemplar tokens are generated from clustering and visualized immediately
+  ✅ Uses your richer global map drawing (SemanticMapLayer vector layers)
+  ✅ Stops early once exemplars are all saved (even if max_scenarios_scan is huge)
 
 Run:
   export NUPLAN_DATA_ROOT=/path/to/nuplan
   export NUPLAN_MAPS_ROOT=/path/to/nuplan/maps
 
-  python unsupervised_cluster_nuplan.py \
+  python unsupervised_kmeans_with_viz.py \
     --split mini \
-    --out_dir ./unsup_clusters_mini \
-    --max_scenarios 20000 \
-    --num_clusters 40 \
-    --map_sample_step 5 \
-    --intersection_tol_m 12 \
-    --connector_radius_m 5 \
-    --exemplars_per_cluster 12 \
-    --review_random_per_cluster 25 \
-    --export_review_pack
+    --scene_labels /path/to/scene_labels.jsonl \
+    --out_dir ./unsup_kmeans_viz \
+    --n_clusters 20 \
+    --exemplars_per_cluster 10 \
+    --max_scenarios_scan 500000 \
+    --map_radius 90
 """
 
 import os
@@ -33,411 +35,250 @@ import json
 import math
 import argparse
 from pathlib import Path
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple, Optional, Set
 
 import numpy as np
+import matplotlib.pyplot as plt
 from tqdm import tqdm
 
-from sklearn.cluster import MiniBatchKMeans
+from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
-from sklearn.decomposition import PCA
 
-import matplotlib.pyplot as plt
-
+# nuPlan imports
 from nuplan.planning.scenario_builder.nuplan_db.nuplan_scenario_builder import NuPlanScenarioBuilder
 from nuplan.planning.scenario_builder.scenario_filter import ScenarioFilter
 from nuplan.planning.utils.multithreading.worker_pool import SingleMachineParallelExecutor
 from nuplan.common.maps.maps_datatypes import SemanticMapLayer
 
-from shapely.geometry import Point
-from shapely.prepared import prep
+
+# --------------------------------------------------------------------------------------
+# Utilities
+# --------------------------------------------------------------------------------------
+def _safe_float(x: Any, default: float = 0.0) -> float:
+    try:
+        if x is None:
+            return default
+        return float(x)
+    except Exception:
+        return default
 
 
-# -----------------------------
-# Small utilities
-# -----------------------------
+def _safe_int(x: Any, default: int = 0) -> int:
+    try:
+        if x is None:
+            return default
+        return int(x)
+    except Exception:
+        return default
+
+
 def wrap_to_pi(angle: float) -> float:
+    """Wrap angle to [-pi, pi]."""
     return (angle + math.pi) % (2.0 * math.pi) - math.pi
 
 
-def _upper(x: Any) -> str:
-    return str(x).upper() if x is not None else ""
-
-
-def compute_ego_xyh(scenario) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    xs, ys, hs = [], [], []
-    for i in range(scenario.get_number_of_iterations()):
-        ego = scenario.get_ego_state_at_iteration(i)
-        xs.append(float(ego.rear_axle.x))
-        ys.append(float(ego.rear_axle.y))
-        hs.append(float(ego.rear_axle.heading))
-    return np.asarray(xs, np.float64), np.asarray(ys, np.float64), np.asarray(hs, np.float64)
-
-
-def endpoint_in_ego_frame(xs: np.ndarray, ys: np.ndarray, hs: np.ndarray) -> Tuple[float, float]:
-    if len(xs) < 2:
-        return 0.0, 0.0
-    x0, y0 = xs[0], ys[0]
-    xT, yT = xs[-1], ys[-1]
-    dx, dy = (xT - x0), (yT - y0)
-    th0 = hs[0]
-    c = math.cos(-th0)
-    s = math.sin(-th0)
-    x_rel = c * dx - s * dy
-    y_rel = s * dx + c * dy
-    return float(x_rel), float(y_rel)
-
-
-def safe_sindex(gdf):
-    try:
-        return gdf.sindex
-    except Exception:
-        return None
-
-
-def get_tags_if_available(scenario) -> List[str]:
-    tags: List[str] = []
-    for attr in ["tags", "scenario_tags", "log_tags"]:
-        if hasattr(scenario, attr):
-            try:
-                val = getattr(scenario, attr)
-                if isinstance(val, (list, tuple)):
-                    tags.extend([_upper(t) for t in val])
-            except Exception:
-                pass
-    for method in ["get_tags", "get_scenario_tags"]:
-        if hasattr(scenario, method):
-            try:
-                val = getattr(scenario, method)()
-                if isinstance(val, (list, tuple)):
-                    tags.extend([_upper(t) for t in val])
-            except Exception:
-                pass
-    seen = set()
-    out = []
-    for t in tags:
-        if t and t not in seen:
-            seen.add(t)
-            out.append(t)
-    return out
-
-
-def contains_any(keys: List[str], s: str) -> bool:
-    ss = _upper(s)
-    return any(k in ss for k in keys)
-
-
-# -----------------------------
-# Map cache (SemanticMapLayer)
-# -----------------------------
-@dataclass
-class IntersectionLayerCache:
-    gdf: Any
-    sindex: Any
-    prepared_geoms: List[Any]  # prepared polygons
-
-
-@dataclass
-class ConnectorLayerCache:
-    gdf: Any
-    sindex: Any
-    turn_col: str
-
-
-class MapLayerCache:
-    def __init__(self):
-        self._inter_cache: Dict[str, IntersectionLayerCache] = {}
-        self._conn_cache: Dict[str, ConnectorLayerCache] = {}
-
-    def _key(self, scenario) -> str:
-        mn = getattr(scenario, "map_name", None)
-        if mn is None:
-            mn = getattr(getattr(scenario, "map_api", None), "map_name", None)
-        if mn:
-            return str(mn)
-        return f"map_api_{id(getattr(scenario, 'map_api', None))}"
-
-    def _get_vector_layer(self, map_api, layer: SemanticMapLayer):
-        try:
-            return map_api._get_vector_map_layer(layer)  # type: ignore[attr-defined]
-        except Exception:
-            return None
-
-    def get_intersection_cache(self, scenario) -> Optional[IntersectionLayerCache]:
-        map_api = getattr(scenario, "map_api", None)
-        if map_api is None:
-            return None
-        key = self._key(scenario)
-        if key in self._inter_cache:
-            return self._inter_cache[key]
-
-        gdf = self._get_vector_layer(map_api, SemanticMapLayer.INTERSECTION)
-        if gdf is None or len(gdf) == 0:
-            self._inter_cache[key] = IntersectionLayerCache(gdf=None, sindex=None, prepared_geoms=[])
-            return self._inter_cache[key]
-
-        sindex = safe_sindex(gdf)
-        prepared = []
-        for geom in gdf.geometry.values:
-            if geom is None:
-                prepared.append(None)
-            else:
-                try:
-                    prepared.append(prep(geom))
-                except Exception:
-                    prepared.append(None)
-
-        self._inter_cache[key] = IntersectionLayerCache(gdf=gdf, sindex=sindex, prepared_geoms=prepared)
-        return self._inter_cache[key]
-
-    def get_connector_cache(self, scenario) -> Optional[ConnectorLayerCache]:
-        map_api = getattr(scenario, "map_api", None)
-        if map_api is None:
-            return None
-        key = self._key(scenario)
-        if key in self._conn_cache:
-            return self._conn_cache[key]
-
-        gdf = self._get_vector_layer(map_api, SemanticMapLayer.LANE_CONNECTOR)
-        if gdf is None or len(gdf) == 0:
-            self._conn_cache[key] = ConnectorLayerCache(gdf=None, sindex=None, turn_col="")
-            return self._conn_cache[key]
-
-        col = ""
-        for c in ["turn_type_fid", "lane_connector_type_fid", "turn_type", "lane_connector_type"]:
-            if c in gdf.columns:
-                col = c
-                break
-
-        sindex = safe_sindex(gdf)
-        self._conn_cache[key] = ConnectorLayerCache(gdf=gdf, sindex=sindex, turn_col=col)
-        return self._conn_cache[key]
-
-
-# -----------------------------
-# Interpretable map features
-# -----------------------------
-def intersection_features(
-    inter_cache: IntersectionLayerCache,
-    xs: np.ndarray,
-    ys: np.ndarray,
-    sample_step: int,
-    tol_m: float,
-) -> Tuple[float, float, float]:
-    if inter_cache is None or inter_cache.gdf is None or len(inter_cache.prepared_geoms) == 0:
-        return 0.0, float("inf"), 0.0
-
-    gdf = inter_cache.gdf
-    sindex = inter_cache.sindex
-    prepared = inter_cache.prepared_geoms
-
-    tol = float(tol_m)
-    hits = 0
-    inside = 0
-    total = 0
-    min_dist = float("inf")
-
-    for i in range(0, len(xs), max(1, sample_step)):
-        total += 1
-        p = Point(float(xs[i]), float(ys[i]))
-
-        if sindex is not None:
-            bbox = (p.x - tol, p.y - tol, p.x + tol, p.y + tol)
-            cand = list(sindex.intersection(bbox))
-        else:
-            cand = range(len(gdf))
-
-        any_hit = False
-        any_inside = False
-
-        for j in cand:
-            geom = gdf.geometry.values[j]
-            if geom is None:
+# --------------------------------------------------------------------------------------
+# Load scene_labels.jsonl and build features
+# --------------------------------------------------------------------------------------
+def load_scene_labels(scene_labels_path: Path) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    with scene_labels_path.open("r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
                 continue
-            pj = prepared[j]
             try:
-                if pj is not None and pj.contains(p):
-                    any_inside = True
-                    any_hit = True
-                    min_dist = 0.0
-                    break
-            except Exception:
-                pass
-            try:
-                d = float(geom.distance(p))
+                rows.append(json.loads(line))
             except Exception:
                 continue
-            if d < min_dist:
-                min_dist = d
-            if d <= tol:
-                any_hit = True
-                break
-
-        if any_hit:
-            hits += 1
-        if any_inside:
-            inside += 1
-
-    hit_ratio = hits / max(1, total)
-    inside_ratio = inside / max(1, total)
-    return float(hit_ratio), float(min_dist), float(inside_ratio)
+    return rows
 
 
-def connector_vote_features(
-    conn_cache: ConnectorLayerCache,
-    xs: np.ndarray,
-    ys: np.ndarray,
-    sample_step: int,
-    radius_m: float,
-) -> Dict[str, float]:
-    if conn_cache is None or conn_cache.gdf is None or len(conn_cache.gdf) == 0:
-        return {
-            "conn_left_ratio": 0.0,
-            "conn_right_ratio": 0.0,
-            "conn_straight_ratio": 0.0,
-            "conn_uturn_ratio": 0.0,
-            "conn_unknown_ratio": 0.0,
-            "conn_none_ratio": 1.0,
-            "conn_best_ratio": 0.0,
-        }
+def build_feature_matrix(rows: List[Dict[str, Any]]) -> Tuple[List[str], np.ndarray, List[str]]:
+    """
+    Build a feature vector per token from fields in scene_labels.jsonl.
 
-    gdf = conn_cache.gdf
-    sindex = conn_cache.sindex
-    col = conn_cache.turn_col
+    We keep features:
+      - travel_distance_m
+      - abs_delta_heading_deg
+      - total_abs_heading_deg
+      - has_intersection_tag (0/1)
+      - has_intersection_map (0/1)
+      - intersection_min_dist_m (clipped)
+      - connector ratios: left/right/straight/uturn/unknown/none
+      - connector_best_ratio
+      - connector_best_type (one-hot over {LEFT,RIGHT,STRAIGHT,UTURN,UNKNOWN,NONE})
 
-    r = float(radius_m)
-    counts = {"LEFT": 0, "RIGHT": 0, "STRAIGHT": 0, "UTURN": 0, "UNKNOWN": 0, "NONE": 0}
-    total = 0
+    Note:
+      - If a field is missing, we fill with 0 or safe default.
+      - This is KMeans-friendly (continuous + normalized later).
+    """
+    tokens: List[str] = []
+    feats: List[List[float]] = []
 
-    def to_label(v) -> str:
-        try:
-            if v is None or (isinstance(v, float) and math.isnan(v)):
-                return "UNKNOWN"
-            iv = int(v)
-        except Exception:
-            return "UNKNOWN"
-        if iv == 0:
-            return "STRAIGHT"
-        if iv == 1:
-            return "LEFT"
-        if iv == 2:
-            return "RIGHT"
-        if iv == 3:
-            return "UTURN"
-        return "UNKNOWN"
+    # feature names (for debugging/printing)
+    feature_names: List[str] = [
+        "travel_distance_m",
+        "abs_delta_heading_deg",
+        "total_abs_heading_deg",
+        "has_intersection_tag",
+        "has_intersection_map",
+        "intersection_min_dist_m_clipped",
+        "conn_left_ratio",
+        "conn_right_ratio",
+        "conn_straight_ratio",
+        "conn_uturn_ratio",
+        "conn_unknown_ratio",
+        "conn_none_ratio",
+        "conn_best_ratio",
+        "best_is_left",
+        "best_is_right",
+        "best_is_straight",
+        "best_is_uturn",
+        "best_is_unknown",
+        "best_is_none",
+    ]
 
-    for i in range(0, len(xs), max(1, sample_step)):
-        total += 1
-        p = Point(float(xs[i]), float(ys[i]))
-
-        if sindex is not None:
-            bbox = (p.x - r, p.y - r, p.x + r, p.y + r)
-            cand_idx = list(sindex.intersection(bbox))
-            cand = gdf.iloc[cand_idx] if cand_idx else None
-        else:
-            cand = gdf
-
-        if cand is None or len(cand) == 0:
-            counts["NONE"] += 1
+    for r in rows:
+        tok = r.get("token", None)
+        if not tok:
             continue
 
-        any_hit = False
-        for _, row in cand.iterrows():
-            geom = row.geometry
-            if geom is None:
-                continue
-            try:
-                d = float(geom.distance(p))
-            except Exception:
-                continue
-            if d <= r:
-                any_hit = True
-                v = row[col] if (col and col in row) else None
-                counts[to_label(v)] += 1
+        dbg = r.get("debug", {}) or {}
 
-        if not any_hit:
-            counts["NONE"] += 1
+        travel = _safe_float(r.get("travel_distance_m", dbg.get("dist", 0.0)), 0.0)
+        abs_dh = _safe_float(dbg.get("abs_delta_heading_deg", None), 0.0)
+        tot_abs = _safe_float(dbg.get("total_abs_heading_deg", None), 0.0)
 
-    denom = max(1, total)
-    left = counts["LEFT"] / denom
-    right = counts["RIGHT"] / denom
-    straight = counts["STRAIGHT"] / denom
-    uturn = counts["UTURN"] / denom
-    unk = counts["UNKNOWN"] / denom
-    none = counts["NONE"] / denom
+        has_itag = 1.0 if bool(dbg.get("has_intersection_tag", False)) else 0.0
+        has_imap = 1.0 if bool(dbg.get("has_intersection_map", False)) else 0.0
 
-    denom2 = max(1e-9, (left + right + straight + uturn + unk))
-    best_ratio = max(left, right, straight, uturn, unk) / denom2
+        inter_min_dist = _safe_float(dbg.get("intersection_min_dist_m", 0.0), 0.0)
+        # clip to keep scale sane (intersection distances can be huge if missing)
+        inter_min_dist = float(np.clip(inter_min_dist, 0.0, 200.0))
 
-    return {
-        "conn_left_ratio": float(left),
-        "conn_right_ratio": float(right),
-        "conn_straight_ratio": float(straight),
-        "conn_uturn_ratio": float(uturn),
-        "conn_unknown_ratio": float(unk),
-        "conn_none_ratio": float(none),
-        "conn_best_ratio": float(best_ratio),
-    }
+        # connector counts -> ratios
+        conn_counts = dbg.get("connector_counts", None)
+        conn_best_type = (dbg.get("connector_best_type", None) or "NONE")
+        conn_best_ratio = _safe_float(dbg.get("connector_best_ratio", 0.0), 0.0)
 
+        # Normalize counts if available
+        # expected keys: LEFT, RIGHT, STRAIGHT, UTURN, UNKNOWN, NONE
+        keys = ["LEFT", "RIGHT", "STRAIGHT", "UTURN", "UNKNOWN", "NONE"]
+        counts = {k: 0.0 for k in keys}
+        if isinstance(conn_counts, dict):
+            for k in keys:
+                counts[k] = _safe_float(conn_counts.get(k, 0.0), 0.0)
 
-# -----------------------------
-# Trajectory features
-# -----------------------------
-def trajectory_features(xs: np.ndarray, ys: np.ndarray, hs: np.ndarray) -> Dict[str, float]:
-    if len(xs) < 3:
-        return {
-            "travel_dist_m": 0.0,
-            "net_heading_deg": 0.0,
-            "abs_net_heading_deg": 0.0,
-            "total_abs_heading_deg": 0.0,
-            "mean_step_dist_m": 0.0,
-            "stationary_ratio": 1.0,
-            "x_end_ego": 0.0,
-            "y_end_ego": 0.0,
+        denom = sum(counts[k] for k in ["LEFT", "RIGHT", "STRAIGHT", "UTURN", "UNKNOWN", "NONE"])
+        denom = max(1.0, denom)
+        ratios = {k: counts[k] / denom for k in keys}
+
+        best = str(conn_best_type).upper().strip()
+        best_is = {
+            "best_is_left": 1.0 if best == "LEFT" else 0.0,
+            "best_is_right": 1.0 if best == "RIGHT" else 0.0,
+            "best_is_straight": 1.0 if best == "STRAIGHT" else 0.0,
+            "best_is_uturn": 1.0 if best == "UTURN" else 0.0,
+            "best_is_unknown": 1.0 if best == "UNKNOWN" else 0.0,
+            "best_is_none": 1.0 if best == "NONE" else 0.0,
         }
 
-    dx = float(xs[-1] - xs[0])
-    dy = float(ys[-1] - ys[0])
-    travel = float(math.hypot(dx, dy))
+        x = [
+            travel,
+            abs_dh,
+            tot_abs,
+            has_itag,
+            has_imap,
+            inter_min_dist,
+            ratios["LEFT"],
+            ratios["RIGHT"],
+            ratios["STRAIGHT"],
+            ratios["UTURN"],
+            ratios["UNKNOWN"],
+            ratios["NONE"],
+            conn_best_ratio,
+            best_is["best_is_left"],
+            best_is["best_is_right"],
+            best_is["best_is_straight"],
+            best_is["best_is_uturn"],
+            best_is["best_is_unknown"],
+            best_is["best_is_none"],
+        ]
 
-    dh_net = wrap_to_pi(float(hs[-1] - hs[0]))
-    net_deg = float(math.degrees(dh_net))
-    abs_net_deg = abs(net_deg)
+        tokens.append(tok)
+        feats.append(x)
 
-    dh = np.diff(hs)
-    dh = np.vectorize(wrap_to_pi)(dh)
-    total_abs_deg = float(math.degrees(float(np.sum(np.abs(dh)))))
-
-    step_dx = np.diff(xs)
-    step_dy = np.diff(ys)
-    step_dist = np.sqrt(step_dx ** 2 + step_dy ** 2)
-    mean_step_dist = float(np.mean(step_dist))
-    stationary_ratio = float(np.mean(step_dist < 0.25))
-
-    x_end_ego, y_end_ego = endpoint_in_ego_frame(xs, ys, hs)
-
-    return {
-        "travel_dist_m": float(travel),
-        "net_heading_deg": float(net_deg),
-        "abs_net_heading_deg": float(abs_net_deg),
-        "total_abs_heading_deg": float(total_abs_deg),
-        "mean_step_dist_m": float(mean_step_dist),
-        "stationary_ratio": float(stationary_ratio),
-        "x_end_ego": float(x_end_ego),
-        "y_end_ego": float(y_end_ego),
-    }
+    X = np.asarray(feats, dtype=np.float32)
+    return tokens, X, feature_names
 
 
-# -----------------------------
-# Scenario loading
-# -----------------------------
-def build_scenarios(split: str, max_scenarios: int, num_workers: int) -> List[Any]:
-    data_root = os.environ["NUPLAN_DATA_ROOT"]
-    map_root = os.environ["NUPLAN_MAPS_ROOT"]
-    db_root = Path(data_root) / "nuplan-v1.1" / "splits" / split
+# --------------------------------------------------------------------------------------
+# KMeans + exemplar selection
+# --------------------------------------------------------------------------------------
+def run_kmeans(tokens: List[str], X: np.ndarray, n_clusters: int, seed: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Returns:
+      labels: [N]
+      centers: [K, D] in scaled space
+      X_scaled: [N, D]
+    """
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X).astype(np.float32)
+
+    kmeans = KMeans(n_clusters=n_clusters, random_state=seed, n_init="auto")
+    labels = kmeans.fit_predict(X_scaled)
+    centers = kmeans.cluster_centers_.astype(np.float32)
+
+    return labels.astype(np.int32), centers, X_scaled
+
+
+def choose_exemplars(
+    tokens: List[str],
+    labels: np.ndarray,
+    centers: np.ndarray,
+    X_scaled: np.ndarray,
+    exemplars_per_cluster: int,
+) -> Dict[int, List[str]]:
+    """
+    Pick exemplar tokens per cluster: closest to centroid.
+    """
+    K = centers.shape[0]
+    exemplars: Dict[int, List[str]] = {k: [] for k in range(K)}
+
+    for k in range(K):
+        idx = np.where(labels == k)[0]
+        if idx.size == 0:
+            continue
+        diffs = X_scaled[idx] - centers[k]
+        dists = np.sqrt(np.sum(diffs * diffs, axis=1))
+        order = np.argsort(dists)
+        chosen = idx[order[: min(exemplars_per_cluster, idx.size)]]
+        exemplars[k] = [tokens[i] for i in chosen]
+
+    return exemplars
+
+
+# --------------------------------------------------------------------------------------
+# nuPlan scenario loading
+# --------------------------------------------------------------------------------------
+def build_scenarios(split: str, limit_total_scenarios: Optional[int], num_workers: int) -> List[Any]:
+    data_root = os.environ.get("NUPLAN_DATA_ROOT", None)
+    map_root = os.environ.get("NUPLAN_MAPS_ROOT", None)
+    if data_root is None or map_root is None:
+        raise RuntimeError(
+            "Please set NUPLAN_DATA_ROOT and NUPLAN_MAPS_ROOT.\n"
+            "Example:\n"
+            "  export NUPLAN_DATA_ROOT=/path/to/nuplan\n"
+            "  export NUPLAN_MAPS_ROOT=/path/to/nuplan/maps"
+        )
+
+    data_root = Path(data_root).expanduser().resolve()
+    map_root = Path(map_root).expanduser().resolve()
+
+    db_root = data_root / "nuplan-v1.1" / "splits" / split
     if not db_root.exists():
-        raise FileNotFoundError(f"Cannot find DB at {db_root}")
+        raise FileNotFoundError(f"Cannot find DB at {db_root}. Check NUPLAN_DATA_ROOT and split.")
 
     worker = SingleMachineParallelExecutor(use_process_pool=False, num_workers=num_workers)
 
@@ -446,7 +287,7 @@ def build_scenarios(split: str, max_scenarios: int, num_workers: int) -> List[An
         log_names=None,
         map_names=None,
         num_scenarios=None,
-        limit_total_scenarios=None if max_scenarios < 0 else max_scenarios,
+        limit_total_scenarios=limit_total_scenarios,
     )
 
     builder = NuPlanScenarioBuilder(
@@ -459,377 +300,410 @@ def build_scenarios(split: str, max_scenarios: int, num_workers: int) -> List[An
         max_workers=num_workers,
     )
 
-    scenarios = builder.get_scenarios(scenario_filter, worker)
-    if max_scenarios > 0:
-        scenarios = scenarios[:max_scenarios]
-    return scenarios
+    return builder.get_scenarios(scenario_filter, worker)
 
 
-# -----------------------------
-# Review pack exporter
-# -----------------------------
-def export_review_pack(
-    out_dir: Path,
-    tokens: List[str],
-    cluster_ids: np.ndarray,
-    X_raw: np.ndarray,
-    feat_names: List[str],
-    exemplars: Dict[str, Any],
+# --------------------------------------------------------------------------------------
+# Map drawing (same “rich” global view you like)
+# --------------------------------------------------------------------------------------
+def get_vector_layers(map_api):
+    lane_gdf = conn_gdf = driv_gdf = rb_gdf = inter_gdf = bound_gdf = None
+
+    try:
+        lane_gdf = map_api._get_vector_map_layer(SemanticMapLayer.LANE)  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    try:
+        conn_gdf = map_api._get_vector_map_layer(SemanticMapLayer.LANE_CONNECTOR)  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    try:
+        driv_gdf = map_api._get_vector_map_layer(SemanticMapLayer.DRIVABLE_AREA)  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    try:
+        rb_gdf = map_api._get_vector_map_layer(SemanticMapLayer.ROADBLOCK)  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    try:
+        inter_gdf = map_api._get_vector_map_layer(SemanticMapLayer.INTERSECTION)  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    try:
+        bound_gdf = map_api._get_vector_map_layer(SemanticMapLayer.BOUNDARIES)  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+    return lane_gdf, conn_gdf, driv_gdf, rb_gdf, inter_gdf, bound_gdf
+
+
+def filter_local_window(gdf, cx: float, cy: float, radius: float):
+    if gdf is None:
+        return None
+    minx = cx - radius
+    maxx = cx + radius
+    miny = cy - radius
+    maxy = cy + radius
+    try:
+        return gdf.cx[minx:maxx, miny:maxy]
+    except Exception:
+        return gdf
+
+
+def plot_local_map(ax, lane_gdf, conn_gdf, driv_gdf, rb_gdf, inter_gdf, bound_gdf):
+    # Drivable area fill
+    if driv_gdf is not None:
+        for geom in driv_gdf.geometry:
+            if geom is None:
+                continue
+            try:
+                if geom.geom_type == "Polygon":
+                    xs, ys = geom.exterior.xy
+                    ax.fill(xs, ys, alpha=0.2)
+                else:
+                    for g in geom.geoms:
+                        xs, ys = g.exterior.xy
+                        ax.fill(xs, ys, alpha=0.2)
+            except Exception:
+                continue
+
+    # Roadblocks outlines
+    if rb_gdf is not None:
+        for geom in rb_gdf.geometry:
+            if geom is None:
+                continue
+            try:
+                if geom.geom_type == "Polygon":
+                    xs, ys = geom.exterior.xy
+                    ax.plot(xs, ys, linewidth=1.0)
+                else:
+                    for g in geom.geoms:
+                        xs, ys = g.exterior.xy
+                        ax.plot(xs, ys, linewidth=1.0)
+            except Exception:
+                continue
+
+    # Intersections outlines
+    if inter_gdf is not None:
+        for geom in inter_gdf.geometry:
+            if geom is None:
+                continue
+            try:
+                if geom.geom_type == "Polygon":
+                    xs, ys = geom.exterior.xy
+                    ax.plot(xs, ys, linewidth=1.0)
+                else:
+                    for g in geom.geoms:
+                        xs, ys = g.exterior.xy
+                        ax.plot(xs, ys, linewidth=1.0)
+            except Exception:
+                continue
+
+    # Boundaries
+    if bound_gdf is not None:
+        for geom in bound_gdf.geometry:
+            if geom is None:
+                continue
+            try:
+                xs, ys = geom.xy
+                ax.plot(xs, ys, linewidth=0.3)
+            except Exception:
+                try:
+                    for g in geom.geoms:
+                        xs, ys = g.xy
+                        ax.plot(xs, ys, linewidth=0.3)
+                except Exception:
+                    continue
+
+    # Lanes
+    if lane_gdf is not None:
+        for geom in lane_gdf.geometry:
+            if geom is None:
+                continue
+            try:
+                xs, ys = geom.xy
+                ax.plot(xs, ys, linewidth=0.5)
+            except Exception:
+                try:
+                    for g in geom.geoms:
+                        xs, ys = g.xy
+                        ax.plot(xs, ys, linewidth=0.5)
+                except Exception:
+                    continue
+
+    # Lane connectors dashed
+    if conn_gdf is not None:
+        for geom in conn_gdf.geometry:
+            if geom is None:
+                continue
+            try:
+                xs, ys = geom.xy
+                ax.plot(xs, ys, linestyle="--", linewidth=1.0)
+            except Exception:
+                try:
+                    for g in geom.geoms:
+                        xs, ys = g.xy
+                        ax.plot(xs, ys, linestyle="--", linewidth=1.0)
+                except Exception:
+                    continue
+
+
+# --------------------------------------------------------------------------------------
+# Trajectory + visualization
+# --------------------------------------------------------------------------------------
+def compute_ego_xyh(scenario) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    xs_list: List[float] = []
+    ys_list: List[float] = []
+    hs_list: List[float] = []
+    n_iter = scenario.get_number_of_iterations()
+    for i in range(n_iter):
+        ego = scenario.get_ego_state_at_iteration(i)
+        xs_list.append(ego.rear_axle.x)
+        ys_list.append(ego.rear_axle.y)
+        hs_list.append(float(ego.rear_axle.heading))
+    return np.asarray(xs_list, dtype=float), np.asarray(ys_list, dtype=float), np.asarray(hs_list, dtype=float)
+
+
+def to_ego_frame(xs: np.ndarray, ys: np.ndarray, hs: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    if len(xs) == 0:
+        return xs, ys
+    x0, y0 = float(xs[0]), float(ys[0])
+    theta0 = float(hs[0])
+    x_rel = xs - x0
+    y_rel = ys - y0
+    c = math.cos(-theta0)
+    s = math.sin(-theta0)
+    x_local = c * x_rel - s * y_rel
+    y_local = s * x_rel + c * y_rel
+    return x_local, y_local
+
+
+def visualize_cluster_exemplar(
+    scenario,
+    out_path: Path,
+    cluster_id: int,
     *,
-    random_per_cluster: int,
-    seed: int,
-) -> None:
-    review_dir = out_dir / "review_pack"
-    review_dir.mkdir(parents=True, exist_ok=True)
+    map_radius: float,
+    meta_text: str,
+) -> bool:
+    xs, ys, hs = compute_ego_xyh(scenario)
+    if len(xs) < 2:
+        return False
 
-    rng = np.random.default_rng(seed)
+    xs_local, ys_local = to_ego_frame(xs, ys, hs)
 
-    K = int(np.max(cluster_ids)) + 1 if cluster_ids.size > 0 else 0
+    dx = float(xs[-1] - xs[0])
+    dy = float(ys[-1] - ys[0])
+    dist = float(math.hypot(dx, dy))
 
-    # Pre-group indices
-    cluster_to_idx: Dict[int, np.ndarray] = {}
-    for c in range(K):
-        idx = np.where(cluster_ids == c)[0]
-        cluster_to_idx[c] = idx
+    dh = wrap_to_pi(float(hs[-1] - hs[0]))
+    dh_deg = float(math.degrees(dh))
+    abs_dh_deg = float(abs(dh_deg))
 
-    # Write a top-level index
-    index = {}
-    for c in range(K):
-        index[str(c)] = {
-            "count": int(cluster_to_idx[c].size),
-            "dir": f"cluster_{c:02d}",
-        }
-    (review_dir / "INDEX.json").write_text(json.dumps(index, indent=2))
+    cx = float(xs.mean())
+    cy = float(ys.mean())
 
-    howto = (
-        "HOW TO VISUALIZE THESE TOKENS USING YOUR EXISTING VISUALIZER\n"
-        "-----------------------------------------------------------\n"
-        "Your visualizer already loops scenarios like:\n"
-        "  for scenario in scenarios:\n"
-        "Add a token filter right after you get `tok = scenario.token`:\n"
-        "\n"
-        "  # >>> REVIEW PACK TOKEN FILTER (ADD THIS)\n"
-        "  if tok not in token_set:\n"
-        "      continue\n"
-        "  # <<< END TOKEN FILTER\n"
-        "\n"
-        "And build token_set from a file before the loop:\n"
-        "  token_set = set(Path(TOKENS_TXT).read_text().splitlines())\n"
-        "\n"
-        "Then point TOKENS_TXT to:\n"
-        "  review_pack/cluster_XX/tokens_exemplars.txt  (best for quick inspection)\n"
-        "or\n"
-        "  review_pack/cluster_XX/tokens_random.txt\n"
+    lane_gdf, conn_gdf, driv_gdf, rb_gdf, inter_gdf, bound_gdf = get_vector_layers(scenario.map_api)
+    lane_gdf = filter_local_window(lane_gdf, cx, cy, map_radius)
+    conn_gdf = filter_local_window(conn_gdf, cx, cy, map_radius)
+    driv_gdf = filter_local_window(driv_gdf, cx, cy, map_radius)
+    rb_gdf = filter_local_window(rb_gdf, cx, cy, map_radius)
+    inter_gdf = filter_local_window(inter_gdf, cx, cy, map_radius)
+    bound_gdf = filter_local_window(bound_gdf, cx, cy, map_radius)
+
+    fig = plt.figure(figsize=(13, 6))
+
+    # Global
+    ax1 = fig.add_subplot(1, 2, 1)
+    plot_local_map(ax1, lane_gdf, conn_gdf, driv_gdf, rb_gdf, inter_gdf, bound_gdf)
+    ax1.plot(xs, ys, "-", linewidth=1.2)
+    ax1.plot(xs[0], ys[0], "go", markersize=6, label="start")
+    ax1.plot(xs[-1], ys[-1], "rs", markersize=6, label="end")
+    ax1.set_aspect("equal", adjustable="box")
+    ax1.set_xlim(cx - map_radius, cx + map_radius)
+    ax1.set_ylim(cy - map_radius, cy + map_radius)
+    ax1.set_xlabel("x [m]")
+    ax1.set_ylabel("y [m]")
+    ax1.set_title(
+        f"Cluster {cluster_id}  |  scenario_type={getattr(scenario, 'scenario_type', '')}\n"
+        f"token={scenario.token}"
+    )
+    ax1.legend(loc="best")
+
+    # Ego
+    ax2 = fig.add_subplot(1, 2, 2)
+    ax2.plot(xs_local, ys_local, "-o", markersize=2.5, linewidth=1.0)
+    ax2.plot(0.0, 0.0, "go", label="start")
+    ax2.plot(xs_local[-1], ys_local[-1], "rs", label="end")
+
+    arrow_len = max(5.0, dist * 0.3)
+    ax2.arrow(
+        0.0, 0.0,
+        arrow_len * math.cos(dh),
+        arrow_len * math.sin(dh),
+        head_width=1.0,
+        head_length=1.0,
+        linewidth=1.0,
+        length_includes_head=True
     )
 
-    for c in range(K):
-        cdir = review_dir / f"cluster_{c:02d}"
-        cdir.mkdir(parents=True, exist_ok=True)
+    ax2.set_aspect("equal", adjustable="box")
+    ax2.set_xlabel("x_ego [m]")
+    ax2.set_ylabel("y_ego [m]")
+    ax2.set_title(
+        f"Ego-frame\nΔheading={dh_deg:+.1f}° (|Δ|={abs_dh_deg:.1f}°), dist={dist:.1f}m\n{meta_text}"
+    )
+    ax2.legend(loc="best")
 
-        idx = cluster_to_idx[c]
-        # tokens
-        all_tokens = [tokens[i] for i in idx.tolist()]
-        (cdir / "tokens_all.txt").write_text("\n".join(all_tokens))
-
-        # exemplars (already chosen by distance)
-        ex = exemplars.get(str(c), {}).get("tokens", [])
-        (cdir / "tokens_exemplars.txt").write_text("\n".join(ex))
-
-        # random sample
-        if idx.size > 0:
-            k = min(int(random_per_cluster), int(idx.size))
-            pick = rng.choice(idx, size=k, replace=False)
-            rand_tokens = [tokens[i] for i in pick.tolist()]
-        else:
-            rand_tokens = []
-        (cdir / "tokens_random.txt").write_text("\n".join(rand_tokens))
-
-        # stats in original units
-        if idx.size > 0:
-            Xc = X_raw[idx]
-            mu = np.mean(Xc, axis=0)
-            sd = np.std(Xc, axis=0)
-            # top 10 features by std dev (just informational)
-            top_var = np.argsort(sd)[::-1][:10].tolist()
-            stats = {
-                "cluster_id": int(c),
-                "count": int(idx.size),
-                "feature_mean": {feat_names[j]: float(mu[j]) for j in range(len(feat_names))},
-                "feature_std": {feat_names[j]: float(sd[j]) for j in range(len(feat_names))},
-                "top_variable_features": [feat_names[j] for j in top_var],
-                "exemplars": ex,
-            }
-        else:
-            stats = {"cluster_id": int(c), "count": 0, "feature_mean": {}, "feature_std": {}, "exemplars": ex}
-
-        (cdir / "stats.json").write_text(json.dumps(stats, indent=2))
-        (cdir / "HOW_TO_VISUALIZE.txt").write_text(howto)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return True
 
 
-# -----------------------------
+# --------------------------------------------------------------------------------------
 # Main
-# -----------------------------
+# --------------------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--split", type=str, default="mini")
+    parser.add_argument("--scene_labels", type=str, required=True)
     parser.add_argument("--out_dir", type=str, required=True)
-    parser.add_argument("--max_scenarios", type=int, default=20000)
+
+    parser.add_argument("--n_clusters", type=int, default=20)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--exemplars_per_cluster", type=int, default=10)
+
+    parser.add_argument("--map_radius", type=float, default=90.0)
+    parser.add_argument("--max_scenarios_scan", type=int, default=50000)
+    parser.add_argument("--limit_load", type=int, default=None)
     parser.add_argument("--num_workers", type=int, default=8)
-
-    parser.add_argument("--num_clusters", type=int, default=40)
-    parser.add_argument("--kmeans_seed", type=int, default=0)
-    parser.add_argument("--batch_size", type=int, default=4096)
-
-    parser.add_argument("--map_sample_step", type=int, default=5)
-    parser.add_argument("--intersection_tol_m", type=float, default=12.0)
-
-    parser.add_argument("--connector_sample_step", type=int, default=5)
-    parser.add_argument("--connector_radius_m", type=float, default=5.0)
-
-    parser.add_argument("--exemplars_per_cluster", type=int, default=12)
-
-    # REVIEW PACK
-    parser.add_argument("--export_review_pack", action="store_true")
-    parser.add_argument("--review_random_per_cluster", type=int, default=25)
 
     args = parser.parse_args()
 
-    out_dir = Path(args.out_dir).expanduser().resolve()
-    out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "plots").mkdir(parents=True, exist_ok=True)
+    scene_labels_path = Path(args.scene_labels).expanduser().resolve()
+    out_root = Path(args.out_dir).expanduser().resolve()
+    out_root.mkdir(parents=True, exist_ok=True)
 
-    labels_path = out_dir / "cluster_labels.jsonl"
-    tokens_path = out_dir / "tokens.txt"
-    feats_path = out_dir / "features.npy"
-    exemplars_path = out_dir / "exemplars.json"
+    print(f"[INFO] Loading labels from: {scene_labels_path}")
+    rows = load_scene_labels(scene_labels_path)
+    print(f"[INFO] Loaded {len(rows)} rows.")
 
-    print(f"[INFO] split={args.split}")
-    print(f"[INFO] max_scenarios={args.max_scenarios}")
-    print(f"[INFO] num_clusters={args.num_clusters}")
-    print(f"[INFO] out_dir={out_dir}")
+    tokens, X, feature_names = build_feature_matrix(rows)
+    if len(tokens) == 0:
+        print("[ERROR] No valid tokens found in scene_labels.jsonl. Exiting.")
+        return
 
-    print("[INFO] Loading scenarios...")
-    scenarios = build_scenarios(args.split, args.max_scenarios, args.num_workers)
-    print(f"[INFO] Loaded {len(scenarios)} scenarios (after hard cap).")
+    print(f"[INFO] Built feature matrix: X.shape={X.shape}")
+    print(f"[INFO] Features: {', '.join(feature_names)}")
 
-    map_cache = MapLayerCache()
+    print(f"[INFO] Running KMeans: K={args.n_clusters}, seed={args.seed}")
+    labels, centers, X_scaled = run_kmeans(tokens, X, n_clusters=args.n_clusters, seed=args.seed)
 
-    tokens: List[str] = []
-    feat_rows: List[List[float]] = []
-    feat_meta: List[Dict[str, Any]] = []
+    # Save clustering assignments
+    clusters_jsonl = out_root / "clusters.jsonl"
+    with clusters_jsonl.open("w") as f:
+        for tok, cid in zip(tokens, labels.tolist()):
+            f.write(json.dumps({"token": tok, "cluster_id": int(cid)}) + "\n")
+    print(f"[INFO] Saved cluster assignments: {clusters_jsonl}")
 
-    FEAT_NAMES = [
-        "travel_dist_m",
-        "mean_step_dist_m",
-        "stationary_ratio",
-        "abs_net_heading_deg",
-        "total_abs_heading_deg",
-        "x_end_ego",
-        "y_end_ego",
-        "inter_hit_ratio",
-        "inter_inside_ratio",
-        "inter_min_dist_m",
-        "conn_left_ratio",
-        "conn_right_ratio",
-        "conn_straight_ratio",
-        "conn_uturn_ratio",
-        "conn_unknown_ratio",
-        "conn_none_ratio",
-        "conn_best_ratio",
-        "tag_intersection",
-        "tag_right_turn",
-        "tag_roundabout",
-        "tag_uturn",
-        "tag_pudo",
-    ]
+    exemplars = choose_exemplars(tokens, labels, centers, X_scaled, exemplars_per_cluster=args.exemplars_per_cluster)
 
-    def flags_from_tags_and_type(stype: str, tags: List[str]) -> Dict[str, float]:
-        st = _upper(stype)
-        t = " ".join(tags)
-        tag_intersection = 1.0 if (contains_any(["INTERSECTION", "TRAFFIC_LIGHT", "STOP_SIGN"], st) or contains_any(["INTERSECTION", "TRAFFIC_LIGHT", "STOP_SIGN"], t)) else 0.0
-        tag_right_turn = 1.0 if (("RIGHT" in st and "TURN" in st) or ("STARTING_RIGHT" in st and "TURN" in st) or ("RIGHT" in t and "TURN" in t)) else 0.0
-        tag_roundabout = 1.0 if ("ROUNDABOUT" in st or "ROUNDABOUT" in t) else 0.0
-        tag_uturn = 1.0 if ("UTURN" in st or "U_TURN" in st or "UTURN" in t or "U_TURN" in t) else 0.0
-        tag_pudo = 1.0 if ("PICKUP_DROPOFF" in st or "PICKUP_DROPOFF" in t or "PUDO" in st or "PUDO" in t) else 0.0
-        return {
-            "tag_intersection": tag_intersection,
-            "tag_right_turn": tag_right_turn,
-            "tag_roundabout": tag_roundabout,
-            "tag_uturn": tag_uturn,
-            "tag_pudo": tag_pudo,
-        }
+    # Print quick stats
+    counts = np.bincount(labels, minlength=args.n_clusters)
+    print("\n[INFO] Cluster sizes:")
+    for k in range(args.n_clusters):
+        print(f"  cluster {k:02d}: {int(counts[k])}")
 
-    print("[INFO] Computing features...")
-    for scenario in tqdm(scenarios, total=len(scenarios), desc="Feature extraction"):
-        tok = str(scenario.token)
-        stype = getattr(scenario, "scenario_type", "")
-        tags = get_tags_if_available(scenario)
+    # Create folders + collect target tokens
+    target_tokens: Set[str] = set()
+    for k in range(args.n_clusters):
+        (out_root / f"cluster_{k:02d}").mkdir(parents=True, exist_ok=True)
+        target_tokens.update(exemplars.get(k, []))
 
-        xs, ys, hs = compute_ego_xyh(scenario)
-        traj_f = trajectory_features(xs, ys, hs)
+    print(f"\n[INFO] Total exemplar tokens to visualize: {len(target_tokens)}")
+    for k in range(args.n_clusters):
+        print(f"  cluster {k:02d}: {len(exemplars.get(k, []))} exemplars")
 
-        inter_cache = map_cache.get_intersection_cache(scenario)
-        inter_hit_ratio, inter_min_dist_m, inter_inside_ratio = (0.0, float("inf"), 0.0)
-        if inter_cache is not None:
-            inter_hit_ratio, inter_min_dist_m, inter_inside_ratio = intersection_features(
-                inter_cache, xs, ys, sample_step=args.map_sample_step, tol_m=args.intersection_tol_m
-            )
+    if len(target_tokens) == 0:
+        print("[WARN] No exemplars selected. Exiting.")
+        return
 
-        conn_cache = map_cache.get_connector_cache(scenario)
-        conn_f = connector_vote_features(
-            conn_cache, xs, ys, sample_step=args.connector_sample_step, radius_m=args.connector_radius_m
-        )
-
-        flags = flags_from_tags_and_type(stype, tags)
-
-        inter_min_dist_num = float(inter_min_dist_m)
-        if not np.isfinite(inter_min_dist_num):
-            inter_min_dist_num = 1e6
-
-        row = [
-            traj_f["travel_dist_m"],
-            traj_f["mean_step_dist_m"],
-            traj_f["stationary_ratio"],
-            traj_f["abs_net_heading_deg"],
-            traj_f["total_abs_heading_deg"],
-            traj_f["x_end_ego"],
-            traj_f["y_end_ego"],
-            float(inter_hit_ratio),
-            float(inter_inside_ratio),
-            float(inter_min_dist_num),
-            conn_f["conn_left_ratio"],
-            conn_f["conn_right_ratio"],
-            conn_f["conn_straight_ratio"],
-            conn_f["conn_uturn_ratio"],
-            conn_f["conn_unknown_ratio"],
-            conn_f["conn_none_ratio"],
-            conn_f["conn_best_ratio"],
-            flags["tag_intersection"],
-            flags["tag_right_turn"],
-            flags["tag_roundabout"],
-            flags["tag_uturn"],
-            flags["tag_pudo"],
-        ]
-
-        tokens.append(tok)
-        feat_rows.append(row)
-        feat_meta.append({
-            "scenario_type": stype,
-            "tags": tags,
-            "features": dict(zip(FEAT_NAMES, row)),
-        })
-
-    X = np.asarray(feat_rows, dtype=np.float32)
-    print(f"[INFO] Feature matrix: X.shape={X.shape}")
-
-    np.save(feats_path, X)
-    tokens_path.write_text("\n".join(tokens))
-    (out_dir / "feature_names.txt").write_text("\n".join(FEAT_NAMES))
-
-    print("[INFO] Scaling features...")
-    scaler = StandardScaler()
-    Xs = scaler.fit_transform(X)
-
-    print("[INFO] Clustering with MiniBatchKMeans...")
-    kmeans = MiniBatchKMeans(
-        n_clusters=int(args.num_clusters),
-        random_state=int(args.kmeans_seed),
-        batch_size=int(args.batch_size),
-        n_init="auto" if hasattr(MiniBatchKMeans, "n_init") else 10,
-        reassignment_ratio=0.01,
-    )
-    cluster_ids = kmeans.fit_predict(Xs)
-    centers = kmeans.cluster_centers_
-
-    print("[INFO] Selecting exemplars (closest to centroid)...")
-    d2 = np.sum((Xs - centers[cluster_ids]) ** 2, axis=1)
-
-    exemplars: Dict[str, Any] = {}
-    for c in range(int(args.num_clusters)):
-        idx = np.where(cluster_ids == c)[0]
-        if idx.size == 0:
-            exemplars[str(c)] = {"count": 0, "tokens": []}
+    # Build quick token->row meta for text overlay
+    token_to_meta: Dict[str, str] = {}
+    for r in rows:
+        tok = r.get("token", "")
+        if not tok:
             continue
-        order = idx[np.argsort(d2[idx])]
-        topk = order[: int(args.exemplars_per_cluster)]
-        exemplars[str(c)] = {
-            "count": int(idx.size),
-            "tokens": [tokens[i] for i in topk],
-        }
-    exemplars_path.write_text(json.dumps(exemplars, indent=2))
+        dbg = r.get("debug", {}) or {}
+        meta = []
+        meta.append(f"stage={r.get('stage','')}")
+        meta.append(f"travel={_safe_float(r.get('travel_distance_m', 0.0),0.0):.1f}m")
+        meta.append(f"|Δh|={_safe_float(dbg.get('abs_delta_heading_deg',0.0),0.0):.1f}°")
+        meta.append(f"tot|Δh|={_safe_float(dbg.get('total_abs_heading_deg',0.0),0.0):.1f}°")
+        meta.append(f"itag={int(bool(dbg.get('has_intersection_tag',False)))} imap={int(bool(dbg.get('has_intersection_map',False)))}")
+        meta.append(f"conn_best={dbg.get('connector_best_type','')}")
+        token_to_meta[tok] = " | ".join(meta)
 
-    print("[INFO] Writing cluster_labels.jsonl ...")
-    with labels_path.open("w") as f:
-        for i, tok in enumerate(tokens):
-            rec = {
-                "token": tok,
-                "cluster_id": int(cluster_ids[i]),
-                "features": feat_meta[i]["features"],
-                "scenario_type": feat_meta[i]["scenario_type"],
-                "tags": feat_meta[i]["tags"],
-            }
-            f.write(json.dumps(rec) + "\n")
+    # Scan scenarios and visualize exemplars
+    print(f"\n[INFO] Loading scenarios from split='{args.split}' ...")
+    scenarios = build_scenarios(args.split, limit_total_scenarios=args.limit_load, num_workers=args.num_workers)
+    print(f"[INFO] Loaded {len(scenarios)} scenarios (devkit load). Will scan up to {args.max_scenarios_scan}.")
 
-    print("[INFO] Making plots...")
-    counts = np.bincount(cluster_ids, minlength=int(args.num_clusters))
-    plt.figure(figsize=(12, 4))
-    plt.bar(np.arange(len(counts)), counts)
-    plt.xlabel("cluster_id")
-    plt.ylabel("count")
-    plt.title("Cluster counts")
-    plt.tight_layout()
-    plt.savefig(out_dir / "plots" / "cluster_counts.png", dpi=160)
-    plt.close()
+    done: Set[str] = set()
+    scanned = 0
+    saved = 0
 
-    pca = PCA(n_components=2, random_state=int(args.kmeans_seed))
-    Xp = pca.fit_transform(Xs)
-    plt.figure(figsize=(7, 6))
-    plt.scatter(Xp[:, 0], Xp[:, 1], s=3, c=cluster_ids)
-    plt.xlabel("PC1")
-    plt.ylabel("PC2")
-    plt.title("PCA scatter colored by cluster_id")
-    plt.tight_layout()
-    plt.savefig(out_dir / "plots" / "pca_scatter.png", dpi=160)
-    plt.close()
+    # For quick lookup: token -> cluster_id (from labels array)
+    token_to_cluster: Dict[str, int] = {tok: int(cid) for tok, cid in zip(tokens, labels.tolist())}
 
-    report_lines = []
-    report_lines.append("Cluster feature profile (means in SCALED feature space):")
-    report_lines.append("Feature order:\n  " + ", ".join(FEAT_NAMES))
-    report_lines.append("")
-    for c in range(int(args.num_clusters)):
-        idx = np.where(cluster_ids == c)[0]
-        if idx.size == 0:
+    for sc in tqdm(scenarios, desc="Scanning scenarios for exemplars"):
+        scanned += 1
+        if args.max_scenarios_scan is not None and scanned > args.max_scenarios_scan:
+            break
+
+        tok = sc.token
+        if tok not in target_tokens:
             continue
-        mu = np.mean(Xs[idx], axis=0)
-        top = np.argsort(np.abs(mu))[::-1][:6]
-        report_lines.append(f"cluster {c:02d}  count={idx.size}")
-        for j in top:
-            report_lines.append(f"  {FEAT_NAMES[j]:24s}  mean_scaled={mu[j]:+.3f}")
-        report_lines.append("")
-    (out_dir / "plots" / "cluster_feature_report.txt").write_text("\n".join(report_lines))
+        if tok in done:
+            continue
 
-    # REVIEW PACK EXPORT
-    if args.export_review_pack:
-        print("[INFO] Exporting review pack...")
-        export_review_pack(
-            out_dir=out_dir,
-            tokens=tokens,
-            cluster_ids=cluster_ids,
-            X_raw=X,  # original units
-            feat_names=FEAT_NAMES,
-            exemplars=exemplars,
-            random_per_cluster=int(args.review_random_per_cluster),
-            seed=int(args.kmeans_seed),
+        cid = token_to_cluster.get(tok, None)
+        if cid is None:
+            continue
+
+        class_dir = out_root / f"cluster_{cid:02d}"
+        idx = sum(1 for t in done if token_to_cluster.get(t, -1) == cid)
+        out_path = class_dir / f"{idx:03d}_token_{tok}.png"
+
+        meta_text = token_to_meta.get(tok, "")
+        ok = visualize_cluster_exemplar(
+            sc,
+            out_path=out_path,
+            cluster_id=cid,
+            map_radius=args.map_radius,
+            meta_text=meta_text,
         )
-        print(f"[INFO] Review pack saved to: {out_dir / 'review_pack'}")
+        if not ok:
+            continue
 
-    print(f"[DONE] Outputs in: {out_dir}")
-    print(f"  - {labels_path.name}")
-    print(f"  - {feats_path.name}, {tokens_path.name}, feature_names.txt")
-    print(f"  - exemplars.json")
-    print(f"  - plots/cluster_counts.png, plots/pca_scatter.png, plots/cluster_feature_report.txt")
-    if args.export_review_pack:
-        print(f"  - review_pack/ (per-cluster tokens + stats + how-to-visualize)")
+        done.add(tok)
+        saved += 1
+
+        # Early stop when all exemplars are done
+        if len(done) >= len(target_tokens):
+            break
+
+    print("\n[INFO] Done.")
+    print(f"[INFO] Scanned scenarios: {scanned}")
+    print(f"[INFO] Saved exemplar PNGs: {saved}/{len(target_tokens)}")
+    print(f"[INFO] Output dir: {out_root}")
+
+    # Save exemplar list for reproducibility
+    exemplar_json = out_root / "exemplars_by_cluster.json"
+    with exemplar_json.open("w") as f:
+        json.dump(exemplars, f, indent=2)
+    print(f"[INFO] Saved exemplar token list: {exemplar_json}")
 
 
 if __name__ == "__main__":
