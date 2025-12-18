@@ -91,3 +91,86 @@ def lane_continuity_gate(
         "hits": int(hits),
         "group_col": str(group_col),
     }
+
+
+
+
+
+
+
+
+
+
+
+
+
+    # Curvature distribution: detect "smooth curvature" vs a localized turn
+    dh_steps = np.diff(headings)
+    dh_steps = np.vectorize(wrap_to_pi)(dh_steps)
+    abs_step_deg = np.degrees(np.abs(dh_steps)) if len(dh_steps) > 0 else np.array([0.0])
+    max_step_abs_deg = float(np.max(abs_step_deg)) if abs_step_deg.size > 0 else 0.0
+    p95_step_abs_deg = float(np.percentile(abs_step_deg, 95)) if abs_step_deg.size > 1 else max_step_abs_deg
+
+
+
+
+
+
+
+    lane_cont = lane_continuity_gate(
+        cache, xs, ys, headings,
+        sample_step=lane_sample_step,
+        match_radius_m=lane_match_radius_m,
+        heading_gate_deg=lane_heading_gate_deg,
+        min_hits=lane_min_hits,
+    )
+    debug["lane_continuity"] = lane_cont
+    lane_cont_ok = bool(lane_cont.get("ok", False))
+
+
+
+
+
+
+
+
+
+
+
+        if NET_TURN_MIN_AT_INTERSECTION <= abs_dh <= NET_TURN_MAX_AT_INTERSECTION:
+            # (2) Connector veto: if connector confidently says STRAIGHT, do NOT allow left/right.
+            bt = str(conn_mm.get("best_type", "NONE"))
+            br = float(conn_mm.get("best_ratio", 0.0))
+            connector_confident = traversed_connector and (br >= float(connector_verify_min_ratio))
+            connector_says_turn = connector_confident and (bt in ("LEFT", "RIGHT"))
+            connector_says_straight = connector_confident and (bt == "STRAIGHT")
+
+            if connector_says_straight:
+                debug["connector_veto_to_straight"] = {"best_type": bt, "best_ratio": br}
+                return 1, "stage3_intersection_connector_veto_straight", debug
+
+            # (1)+(3) Curved-lane-following gate:
+            # If curvature is smooth and ego stays in same lane-corridor, treat as straight-through.
+            if lane_following_ok and lane_cont_ok and smooth_curvature and (not connector_says_turn):
+                debug["curved_lane_following_promoted_to_straight"] = {
+                    "lane_following_ok": bool(lane_following_ok),
+                    "lane_cont_ok": bool(lane_cont_ok),
+                    "smooth_curvature": bool(smooth_curvature),
+                    "max_step_abs_heading_deg": max_step_abs_deg,
+                    "connector_best_type": bt,
+                    "connector_best_ratio": br,
+                }
+                return 1, "stage3_intersection_curved_lane_following", debug
+
+            # Otherwise: it is a real turn candidate by net heading
+            geom_cls = 0 if delta_heading > 0.0 else 2  # left if positive, else right
+
+            if traversed_connector and connector_confident:
+                debug["connector_verify_note"] = f"best={bt}, ratio={br:.2f}"
+                if (geom_cls == 0 and bt == "RIGHT") or (geom_cls == 2 and bt == "LEFT"):
+                    debug["connector_verify_conflict"] = True
+
+            return geom_cls, "stage3_intersection_net_heading", debug
+
+
+
