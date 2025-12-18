@@ -174,3 +174,34 @@ def lane_continuity_gate(
 
 
 
+
+
+
+
+
+
+# Stronger "STRAIGHT veto": only when we are confident it's a curved-straight case
+STRAIGHT_VETO_MIN_RATIO = 0.80          # raise from ~0.55
+STRAIGHT_VETO_MAX_ABS_DH_DEG = 55.0     # don't veto real turns (>~60°)
+
+if connector_confident and bt == "STRAIGHT" and br >= STRAIGHT_VETO_MIN_RATIO:
+    if (math.degrees(abs_dh) <= STRAIGHT_VETO_MAX_ABS_DH_DEG) and lane_following_ok and lane_cont_ok and smooth_curvature:
+        debug["connector_veto_to_straight"] = {
+            "best_type": bt, "best_ratio": br,
+            "abs_dh_deg": math.degrees(abs_dh),
+            "lane_following_ok": lane_following_ok,
+            "lane_cont_ok": lane_cont_ok,
+            "smooth_curvature": smooth_curvature,
+        }
+        return 1, "stage3_intersection_connector_veto_straight", debug
+    else:
+        debug["connector_veto_blocked"] = {
+            "best_type": bt, "best_ratio": br,
+            "abs_dh_deg": math.degrees(abs_dh),
+            "lane_following_ok": lane_following_ok,
+            "lane_cont_ok": lane_cont_ok,
+            "smooth_curvature": smooth_curvature,
+        }
+
+
+
