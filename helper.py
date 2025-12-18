@@ -205,3 +205,38 @@ if connector_confident and bt == "STRAIGHT" and br >= STRAIGHT_VETO_MIN_RATIO:
 
 
 
+
+
+
+
+
+
+# Extra U-turn fallback: loop-like turnaround even if net heading isn't ~pi
+UTURN_TOTAL_ABS_MIN = math.radians(200.0)   # strong accumulated turning
+UTURN_LOOPINESS_MIN = 1.8
+UTURN_MAX_DIST_M = 35.0                    # tune (depends on horizon)
+
+if (total_abs >= UTURN_TOTAL_ABS_MIN) and (loopiness >= UTURN_LOOPINESS_MIN) and (dist <= UTURN_MAX_DIST_M) and lane_following_ok:
+    debug["uturn_reason"] = {
+        "prio": "3b",
+        "source": "geometry_loop",
+        "total_abs_deg": math.degrees(total_abs),
+        "loopiness": loopiness,
+        "dist": dist,
+        "abs_dh_deg": math.degrees(abs_dh),
+    }
+    return UTURN_CLASS_ID, "stage3_geometry_uturn_loop", debug
+
+
+
+
+
+
+
+
+
+if traversed_connector:
+    tc = conn_mm.get("turn_counts", {}) or {}
+    if int(tc.get("UTURN", 0)) >= 1 and float(conn_mm.get("best_ratio", 0.0)) >= 0.40:
+        debug["uturn_reason"] = {"prio": 2.5, "source": "connector_has_uturn_hit", "turn_counts": tc}
+        return UTURN_CLASS_ID, "stage3_map_uturn_soft", debug
