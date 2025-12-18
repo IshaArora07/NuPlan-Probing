@@ -177,6 +177,34 @@ def _print_layers_from_location(location: str, map_version: str, map_root: str) 
         print("  (none)")
 
 
+
+import numpy as np
+
+def to_str_list(x) -> list[str]:
+    """Convert list/tuple/np.ndarray of items to a clean list[str]."""
+    if x is None:
+        return []
+    if isinstance(x, np.ndarray):
+        x = x.tolist()
+    if isinstance(x, (list, tuple)):
+        out = []
+        for v in x:
+            if isinstance(v, np.ndarray):
+                v = v.tolist()
+            if v is None:
+                continue
+            out.append(str(v))
+        return out
+    return [str(x)]
+
+def U(x) -> str:
+    """Safe upper()."""
+    if isinstance(x, np.ndarray):
+        x = x.tolist()
+    return str(x).upper()
+
+
+
 # -------------------------------------------------------------------
 # Main
 # -------------------------------------------------------------------
