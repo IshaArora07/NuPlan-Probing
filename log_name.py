@@ -1,41 +1,30 @@
 #!/usr/bin/env python3
 """
-Given tokens.txt (scenario tokens as hex strings), scan ALL nuPlan split DBs and output (log_name, scenario_token).
+Given a tokens.txt (scenario tokens as hex strings), scan ALL nuPlan split DBs and output
+(log_name, scenario_token_hex) pairs.
 
-This version is BLOB-safe:
-  - scene.token is BLOB
-  - scene.log_token is BLOB
-We match via SQLite HEX(BLOB) strings:
-  - lower(hex(scene.token)) compared to tokens.txt normalized strings.
-
-Outputs:
-  - selected_scenarios.csv    (log_name,scenario_token_hex_lower)
+- Handles nuPlan schema where scene/scenario.token and log_token are BLOB (usually 8 bytes).
+- Accepts tokens.txt lines like: 01fcea70e3e4517f (case-insensitive, no hyphens needed).
+- Outputs:
+  - selected_scenarios.csv    (log_name,scenario_token)
   - selected_scenarios.jsonl  {"log_name":..., "token":...}
   - missing_tokens.txt
+  - summary.json
 
 Usage:
   export NUPLAN_DATA_ROOT=/path/to/nuplan
-  python tokens_to_logname_pairs_blobsafe.py --split trainval --tokens tokens.txt --out_dir ./out
-
-Notes:
-  - Does NOT require listing DB files.
-  - Does NOT assume a 'scenario' table exists; tries 'scene' then 'scenario'.
-  - Resolves log name from table 'log' column 'logfile' (common in nuPlan DBs).
+  python tokens_to_logname_pairs.py --split trainval --tokens tokens.txt --out_dir ./out
 """
 
 import argparse
-import csv
-import json
 import os
-import re
 import sqlite3
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set, Tuple
+import csv
+import json
 
 from tqdm import tqdm
-
-
-HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
 
 
 # -----------------------
@@ -58,38 +47,176 @@ def first_existing_table(tables: Set[str], candidates: Sequence[str]) -> Optiona
     return None
 
 
-def pick_log_name_col(log_cols: Set[str]) -> Optional[str]:
-    # Your DB shows: log.logfile
-    for c in ["logfile", "log_name", "name", "filename", "log_file", "logpath"]:
-        if c in log_cols:
+def choose_token_column(cols: Set[str]) -> Optional[str]:
+    # nuPlan typically uses token
+    if "token" in cols:
+        return "token"
+    for c in ["scenario_token", "scene_token", "id_token"]:
+        if c in cols:
             return c
     return None
 
 
-def normalize_token_str(s: str) -> Optional[str]:
-    """
-    Normalize token strings to lower hex without hyphens/spaces.
-    Returns None if it doesn't look like hex.
-    """
-    t = s.strip().lower().replace("-", "").replace(" ", "")
-    if not t:
-        return None
-    if len(t) % 2 != 0:
-        # hex(BLOB) always even length
-        return None
-    if not HEX_RE.match(t):
-        return None
-    return t
+def choose_log_token_column(cols: Set[str]) -> Optional[str]:
+    # nuPlan typically uses log_token in scene/scenario
+    for c in ["log_token", "log_id", "log"]:
+        if c in cols:
+            return c
+    return None
 
 
+def choose_log_table_and_namecol(conn: sqlite3.Connection, tables: Set[str]) -> Optional[Tuple[str, str, str]]:
+    """
+    Returns (log_table, log_token_col, log_name_col).
+    Common in nuPlan:
+      log(token BLOB, logfile VARCHAR(64))
+    Sometimes also:
+      log(token, log_name) or (token, name)
+    """
+    if "log" not in tables:
+        return None
+    cols = table_columns(conn, "log")
+
+    # token col
+    log_token_col = None
+    if "token" in cols:
+        log_token_col = "token"
+    else:
+        for c in ["log_token", "id", "uuid"]:
+            if c in cols:
+                log_token_col = c
+                break
+    if log_token_col is None:
+        return None
+
+    # name col
+    log_name_col = None
+    for c in ["logfile", "log_name", "name", "logfile_name", "filename"]:
+        if c in cols:
+            log_name_col = c
+            break
+    if log_name_col is None:
+        return None
+
+    return ("log", log_token_col, log_name_col)
+
+
+def normalize_hex_token(s: str) -> str:
+    """
+    Normalize a token line to lowercase hex without 0x and without whitespace.
+    """
+    t = s.strip()
+    if t.startswith("0x") or t.startswith("0X"):
+        t = t[2:]
+    t = t.replace("-", "").replace(" ", "").replace("\t", "").replace("\r", "")
+    return t.lower()
+
+
+def hex_to_blob_bytes(hex_token: str) -> Optional[bytes]:
+    """
+    Convert a hex string (e.g. '01fcea70e3e4517f') into bytes for sqlite BLOB matching.
+    Returns None if invalid.
+    """
+    ht = normalize_hex_token(hex_token)
+    if not ht:
+        return None
+    if len(ht) % 2 != 0:
+        return None
+    try:
+        return bytes.fromhex(ht)
+    except Exception:
+        return None
+
+
+def find_mapping_in_db(db_path: Path, wanted_hex_tokens: Set[str]) -> Dict[str, str]:
+    """
+    Return mapping: token_hex_lower -> log_name found in this DB.
+    This assumes scene/scenario.token is a BLOB and your wanted tokens are hex strings.
+    """
+    out: Dict[str, str] = {}
+    if not wanted_hex_tokens:
+        return out
+
+    # Pre-convert wanted tokens into (hex_lower, blob_bytes)
+    wanted_pairs: List[Tuple[str, bytes]] = []
+    for ht in wanted_hex_tokens:
+        b = hex_to_blob_bytes(ht)
+        if b is not None:
+            wanted_pairs.append((normalize_hex_token(ht), b))
+
+    if not wanted_pairs:
+        return out
+
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    try:
+        tables = list_tables(conn)
+
+        scen_table = first_existing_table(tables, ["scene", "scenario"])
+        if scen_table is None:
+            # heuristic fallback
+            for t in sorted(tables):
+                cols = table_columns(conn, t)
+                if "token" in cols and any(k in cols for k in ["log_token", "log_id", "log"]):
+                    scen_table = t
+                    break
+        if scen_table is None:
+            return out
+
+        scen_cols = table_columns(conn, scen_table)
+        token_col = choose_token_column(scen_cols)
+        log_link_col = choose_log_token_column(scen_cols)
+        if token_col is None or log_link_col is None:
+            return out
+
+        log_info = choose_log_table_and_namecol(conn, tables)
+        if log_info is None:
+            return out
+        log_table, log_token_col, log_name_col = log_info
+
+        # SQLite variable limit ~999 -> keep safe
+        B = 900
+
+        # We query using BLOB params and SELECT hex(token) to map back to hex string
+        for i in range(0, len(wanted_pairs), B):
+            chunk_pairs = wanted_pairs[i : i + B]
+            blob_chunk = [sqlite3.Binary(b) for (_, b) in chunk_pairs]
+            qmarks = ",".join(["?"] * len(blob_chunk))
+
+            query = f"""
+                SELECT hex(s.{token_col}) AS scen_hex, l.{log_name_col} AS log_name
+                FROM {scen_table} s
+                JOIN {log_table} l
+                  ON s.{log_link_col} = l.{log_token_col}
+                WHERE s.{token_col} IN ({qmarks})
+            """
+            try:
+                rows = conn.execute(query, blob_chunk).fetchall()
+            except sqlite3.OperationalError:
+                return out
+
+            for r in rows:
+                # SQLite hex() returns uppercase hex without 0x
+                scen_hex = str(r["scen_hex"]).strip().lower()
+                ln = str(r["log_name"])
+                out[scen_hex] = ln
+
+        return out
+    finally:
+        conn.close()
+
+
+# -----------------------
+# Main
+# -----------------------
 def read_tokens_file(path: Path) -> List[str]:
     toks: List[str] = []
     for line in path.read_text().splitlines():
-        nt = normalize_token_str(line)
-        if nt is None:
+        t = normalize_hex_token(line)
+        if not t:
             continue
-        toks.append(nt)
-    # de-dupe preserving order
+        toks.append(t)
+    # de-dup preserve order
     seen = set()
     out = []
     for t in toks:
@@ -99,86 +226,6 @@ def read_tokens_file(path: Path) -> List[str]:
     return out
 
 
-def build_logtoken_to_logname(conn: sqlite3.Connection) -> Dict[str, str]:
-    """
-    Build mapping: lower(hex(log.token)) -> log_name (logfile/log_name/etc).
-    """
-    tables = list_tables(conn)
-    if "log" not in tables:
-        return {}
-
-    log_cols = table_columns(conn, "log")
-    if "token" not in log_cols:
-        return {}
-
-    name_col = pick_log_name_col(log_cols)
-    if name_col is None:
-        return {}
-
-    out: Dict[str, str] = {}
-    # log table is typically small; read all
-    q = f"SELECT hex(token) AS log_hex, {name_col} AS log_name FROM log"
-    for row in conn.execute(q):
-        log_hex = (row[0] or "").strip().lower()
-        log_name = str(row[1]) if row[1] is not None else ""
-        if log_hex:
-            out[log_hex] = log_name
-    return out
-
-
-def find_pairs_in_db(db_path: Path, wanted_hex: Set[str]) -> Dict[str, str]:
-    """
-    Return mapping: scenario_token_hex_lower -> log_name, for matches found in this DB.
-    """
-    out: Dict[str, str] = {}
-    if not wanted_hex:
-        return out
-
-    conn = sqlite3.connect(str(db_path))
-    try:
-        tables = list_tables(conn)
-
-        scen_table = first_existing_table(tables, ["scene", "scenario"])
-        if scen_table is None:
-            return out
-
-        scen_cols = table_columns(conn, scen_table)
-        # Need BLOB token + log_token
-        if "token" not in scen_cols or "log_token" not in scen_cols:
-            return out
-
-        logtoken_to_name = build_logtoken_to_logname(conn)
-        if not logtoken_to_name:
-            return out
-
-        # Stream over scene/scenario rows and filter in Python
-        q = f"SELECT hex(token) AS scen_hex, hex(log_token) AS log_hex FROM {scen_table}"
-        cur = conn.execute(q)
-
-        while True:
-            rows = cur.fetchmany(5000)
-            if not rows:
-                break
-            for scen_hex_u, log_hex_u in rows:
-                if scen_hex_u is None or log_hex_u is None:
-                    continue
-                scen_hex = str(scen_hex_u).strip().lower()
-                if scen_hex in wanted_hex:
-                    log_hex = str(log_hex_u).strip().lower()
-                    log_name = logtoken_to_name.get(log_hex, "")
-                    if log_name:
-                        out[scen_hex] = log_name
-
-        return out
-    except sqlite3.Error:
-        return out
-    finally:
-        conn.close()
-
-
-# -----------------------
-# Main
-# -----------------------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--split", required=True, help="Split name, e.g. mini, trainval")
@@ -202,52 +249,71 @@ def main():
     out_dir = Path(args.out_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    tokens = read_tokens_file(Path(args.tokens))
+    tokens = read_tokens_file(Path(args.tokens))  # normalized lowercase hex
     wanted = set(tokens)
 
     print(f"[INFO] split_dir: {split_dir}")
     print(f"[INFO] #db_files: {len(db_files)}")
-    print(f"[INFO] #wanted_tokens(valid hex): {len(tokens)}")
+    print(f"[INFO] #wanted_tokens: {len(tokens)}")
 
     token_to_log: Dict[str, str] = {}
+    per_db_found: List[Tuple[str, int]] = []
+
     remaining = set(tokens)
 
-    for db in tqdm(db_files, desc="Scanning DBs", unit="db"):
+    for db in tqdm(db_files, total=len(db_files), desc="Scanning DBs", unit="db"):
         if not remaining:
             break
-        found_map = find_pairs_in_db(db, remaining)
-        if found_map:
-            token_to_log.update(found_map)
-            remaining -= set(found_map.keys())
+        m = find_mapping_in_db(db, remaining)
+        per_db_found.append((db.name, len(m)))
+        token_to_log.update(m)
+        remaining -= set(m.keys())
 
     found = len(token_to_log)
     missing = [t for t in tokens if t not in token_to_log]
 
     print(f"[INFO] Found: {found} / {len(tokens)}")
     print(f"[INFO] Missing: {len(missing)}")
+    print("[INFO] Per-DB hits (top 15):")
+    for name, cnt in sorted(per_db_found, key=lambda x: x[1], reverse=True)[:15]:
+        print(f"  {name}: {cnt}")
 
-    # Write outputs
     csv_path = out_dir / "selected_scenarios.csv"
     jsonl_path = out_dir / "selected_scenarios.jsonl"
     missing_path = out_dir / "missing_tokens.txt"
+    stats_path = out_dir / "summary.json"
 
     with csv_path.open("w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["log_name", "scenario_token"])
         for t in tokens:
-            ln = token_to_log.get(t, None)
-            if ln is not None:
-                w.writerow([ln, t])
+            if t in token_to_log:
+                w.writerow([token_to_log[t], t])
 
     with jsonl_path.open("w") as f:
         for t in tokens:
-            ln = token_to_log.get(t, None)
-            if ln is not None:
-                f.write(json.dumps({"log_name": ln, "token": t}) + "\n")
+            if t in token_to_log:
+                f.write(json.dumps({"log_name": token_to_log[t], "token": t}) + "\n")
 
     missing_path.write_text("\n".join(missing) + ("\n" if missing else ""))
 
-    print(f"[DONE] Wrote:\n  {csv_path}\n  {jsonl_path}\n  {missing_path}")
+    summary = {
+        "split": args.split,
+        "split_dir": str(split_dir),
+        "db_files": len(db_files),
+        "wanted_tokens": len(tokens),
+        "found": found,
+        "missing": len(missing),
+        "per_db_found": [{"db": n, "count": c} for n, c in per_db_found],
+        "outputs": {
+            "csv": str(csv_path),
+            "jsonl": str(jsonl_path),
+            "missing_tokens": str(missing_path),
+        },
+    }
+    stats_path.write_text(json.dumps(summary, indent=2) + "\n")
+
+    print(f"[DONE] Wrote:\n  {csv_path}\n  {jsonl_path}\n  {missing_path}\n  {stats_path}")
 
 
 if __name__ == "__main__":
