@@ -1,249 +1,221 @@
 #!/usr/bin/env python3
 """
-Recover (log_name, scenario_token) pairs from nuPlan split DBs given scenario tokens.
+Given:
+  - a nuPlan sqlite DB (with tables like log + scenario OR log + scene)
+  - a tokens.txt (one token per line)
 
-Inputs:
-  - tokens.txt: one scenario token per line
-
-Outputs:
-  - scenario_tokens.json : JSON list of [log_name, token] pairs (Hydra-friendly)
-  - scenario_tokens.txt  : "log_name token" per line
-  - missing_tokens.txt   : tokens not found in split
+Output:
+  - scenario_tokens.json : list of [log_name, token] pairs (ScenarioFilter.scenario_tokens compatible)
+  - scenario_tokens.tsv  : tab-separated log_name  token
+  - summary stats printed
 
 Usage:
-  export NUPLAN_DATA_ROOT=/path/to/nuplan
-
-  python recover_log_names_from_tokens.py \
-    --split trainval \
-    --tokens_txt /path/to/tokens.txt \
-    --out_dir ./out_tokens \
-    --db_glob "*.db"
-
-Notes:
-  - This does NOT instantiate scenarios, so it’s much faster than ScenarioBuilder.
-  - Assumes tokens are *scenario tokens* (not lidarpc tokens).
+  python tokens_to_log_and_token_pairs.py \
+    --db /path/to/nuplan.db \
+    --tokens tokens.txt \
+    --out_dir ./out_pairs
 """
 
-import os
-import json
 import argparse
+import json
+import os
 import sqlite3
+from collections import Counter
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
-from glob import glob
+from typing import Dict, List, Optional, Tuple
 
 
-def read_tokens(tokens_txt: Path) -> List[str]:
-    tokens = []
-    with tokens_txt.open("r") as f:
+def read_tokens(tokens_path: Path) -> List[str]:
+    toks = []
+    with tokens_path.open("r") as f:
         for line in f:
             t = line.strip()
-            if t:
-                tokens.append(t)
-    # de-dup preserving order
+            if t and not t.startswith("#"):
+                toks.append(t)
+    # de-dup, preserve order
     seen = set()
     out = []
-    for t in tokens:
+    for t in toks:
         if t not in seen:
             seen.add(t)
             out.append(t)
     return out
 
 
-def table_exists(conn: sqlite3.Connection, table: str) -> bool:
+def table_exists(conn: sqlite3.Connection, name: str) -> bool:
     cur = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name=?;",
-        (table,),
+        "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+        (name,),
     )
     return cur.fetchone() is not None
 
 
-def get_columns(conn: sqlite3.Connection, table: str) -> List[str]:
+def get_table_columns(conn: sqlite3.Connection, table: str) -> List[str]:
     cur = conn.execute(f"PRAGMA table_info({table});")
-    return [r[1] for r in cur.fetchall()]  # r[1] is column name
+    return [row[1] for row in cur.fetchall()]  # row[1] = column name
 
 
-def chunked(seq: Sequence[str], n: int) -> List[List[str]]:
-    return [list(seq[i : i + n]) for i in range(0, len(seq), n)]
+def choose_scene_table(conn: sqlite3.Connection) -> str:
+    # Prefer "scenario" if present, else fallback to "scene"
+    if table_exists(conn, "scenario"):
+        return "scenario"
+    if table_exists(conn, "scene"):
+        return "scene"
+    # last resort: try to find any table that has a "token" column and looks plausible
+    cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table';")
+    tables = [r[0] for r in cur.fetchall()]
+    candidates = []
+    for t in tables:
+        cols = get_table_columns(conn, t)
+        if "token" in cols:
+            candidates.append(t)
+    raise RuntimeError(
+        f"Could not find 'scenario' or 'scene' table. Tables with a 'token' column: {candidates}"
+    )
 
 
-def pick_first(existing: List[str], candidates: List[str]) -> Optional[str]:
-    s = set(existing)
-    for c in candidates:
-        if c in s:
-            return c
-    return None
-
-
-def resolve_log_name_from_log_row(row: sqlite3.Row, log_cols: List[str]) -> Optional[str]:
+def choose_log_join_columns(conn: sqlite3.Connection, scene_table: str) -> Tuple[str, str]:
     """
-    Try common log-name columns. nuPlan DBs often have something like:
-      - log.logfile
-      - log.name
-      - log.log_name
+    Returns (scene_log_fk_col, log_name_col)
+    Typical:
+      scene_table has: log_token (FK -> log.token)
+      log table has: log_name (or name)
     """
-    for c in ["logfile", "name", "log_name"]:
-        if c in log_cols and row[c] is not None:
-            return str(row[c])
-    return None
-
-
-def build_query(conn: sqlite3.Connection) -> Tuple[str, str, str]:
-    """
-    Returns (sql, mode, logname_expr_description)
-
-    mode:
-      - "direct": scenario table has log_name column
-      - "join":  scenario joins log table
-    """
-    if not table_exists(conn, "scenario"):
-        raise RuntimeError("DB does not contain a 'scenario' table.")
-
-    scenario_cols = get_columns(conn, "scenario")
-
-    # Best case: scenario has log_name directly
-    if "log_name" in scenario_cols:
-        sql = "SELECT token AS scenario_token, log_name AS log_name FROM scenario WHERE token IN ({placeholders})"
-        return sql, "direct", "scenario.log_name"
-
-    # Otherwise, try join with log table
     if not table_exists(conn, "log"):
+        raise RuntimeError("DB has no 'log' table, cannot map tokens -> log_name.")
+
+    scene_cols = set(get_table_columns(conn, scene_table))
+    log_cols = set(get_table_columns(conn, "log"))
+
+    # Find FK column in scene/scenario table pointing to log
+    for fk in ["log_token", "log_id", "log", "log_key"]:
+        if fk in scene_cols:
+            scene_log_fk_col = fk
+            break
+    else:
+        # try anything containing 'log' and 'token' first
+        maybe = [c for c in scene_cols if ("log" in c.lower() and "token" in c.lower())]
+        if maybe:
+            scene_log_fk_col = maybe[0]
+        else:
+            raise RuntimeError(
+                f"Couldn't find a log foreign-key column in '{scene_table}'. "
+                f"Columns are: {sorted(scene_cols)}"
+            )
+
+    # Find log name column
+    for lc in ["log_name", "name", "logfile", "filename"]:
+        if lc in log_cols:
+            log_name_col = lc
+            break
+    else:
         raise RuntimeError(
-            "DB 'scenario' table has no log_name column and DB has no 'log' table to join."
+            f"Couldn't find a log name column in 'log'. Columns are: {sorted(log_cols)}"
         )
 
-    log_cols = get_columns(conn, "log")
-
-    # scenario.log_token -> log.token is the typical pattern
-    scen_fk = pick_first(scenario_cols, ["log_token", "log_id", "log"])
-    log_pk = pick_first(log_cols, ["token", "id", "log_token"])
-
-    if scen_fk is None or log_pk is None:
-        raise RuntimeError(
-            f"Could not identify scenario->log join keys. "
-            f"scenario cols={scenario_cols}, log cols={log_cols}"
-        )
-
-    # pick the best available log name expression
-    log_name_col = pick_first(log_cols, ["logfile", "name", "log_name"])
-    if log_name_col is None:
-        raise RuntimeError(
-            f"Could not find a log name column in log table. log cols={log_cols}"
-        )
-
-    sql = (
-        "SELECT s.token AS scenario_token, l.{log_name_col} AS log_name "
-        "FROM scenario s "
-        "JOIN log l ON s.{scen_fk} = l.{log_pk} "
-        "WHERE s.token IN ({placeholders})"
-    ).format(log_name_col=log_name_col, scen_fk=scen_fk, log_pk=log_pk)
-
-    return sql, "join", f"JOIN scenario.{scen_fk} -> log.{log_pk}, log.{log_name_col}"
+    return scene_log_fk_col, log_name_col
 
 
-def fetch_pairs_from_db(db_path: Path, tokens: List[str]) -> Dict[str, str]:
+def build_token_to_logname(
+    conn: sqlite3.Connection, scene_table: str, scene_log_fk_col: str, log_name_col: str
+) -> Dict[str, str]:
     """
-    Returns mapping: scenario_token -> log_name for tokens found in this DB.
+    Build mapping token -> log_name using a join:
+      SELECT s.token, l.<log_name_col>
+      FROM <scene_table> s
+      JOIN log l ON s.<scene_log_fk_col> = l.token
     """
-    out: Dict[str, str] = {}
+    # log primary key token is typically "token"
+    log_cols = set(get_table_columns(conn, "log"))
+    if "token" not in log_cols:
+        raise RuntimeError(f"'log' table doesn't have 'token' column. Columns: {sorted(log_cols)}")
 
-    conn = sqlite3.connect(str(db_path))
-    conn.row_factory = sqlite3.Row
-    try:
-        sql_template, mode, desc = build_query(conn)
-
-        # SQLite IN (...) has a practical parameter limit; 900 is safe.
-        for chunk in chunked(tokens, 900):
-            placeholders = ",".join(["?"] * len(chunk))
-            sql = sql_template.format(placeholders=placeholders)
-
-            cur = conn.execute(sql, chunk)
-            rows = cur.fetchall()
-            for r in rows:
-                st = str(r["scenario_token"])
-                ln = r["log_name"]
-                if ln is None:
-                    continue
-                out[st] = str(ln)
-
-    finally:
-        conn.close()
-
-    return out
+    query = f"""
+    SELECT s.token as scene_token, l.{log_name_col} as log_name
+    FROM {scene_table} s
+    JOIN log l
+      ON s.{scene_log_fk_col} = l.token
+    """
+    cur = conn.execute(query)
+    mapping = {}
+    for scene_token, log_name in cur.fetchall():
+        if scene_token is None or log_name is None:
+            continue
+        mapping[str(scene_token)] = str(log_name)
+    return mapping
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--split", required=True, type=str, help="mini, trainval, etc.")
-    parser.add_argument("--tokens_txt", required=True, type=str, help="Path to tokens.txt (one scenario token per line)")
-    parser.add_argument("--out_dir", required=True, type=str, help="Output directory")
-    parser.add_argument("--db_glob", default="*.db", type=str, help="DB filename glob under split directory (default: *.db)")
-    args = parser.parse_args()
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--db", required=True, type=str, help="Path to nuPlan sqlite DB file")
+    ap.add_argument("--tokens", required=True, type=str, help="Path to tokens.txt (one token per line)")
+    ap.add_argument("--out_dir", required=True, type=str, help="Output directory")
+    ap.add_argument("--strict", action="store_true", help="If set, fail if any token is missing in DB")
+    args = ap.parse_args()
 
-    data_root = os.environ.get("NUPLAN_DATA_ROOT", None)
-    if not data_root:
-        raise RuntimeError("Please set NUPLAN_DATA_ROOT.")
-
-    split_root = Path(data_root) / "nuplan-v1.1" / "splits" / args.split
-    if not split_root.exists():
-        raise FileNotFoundError(f"Split root not found: {split_root}")
-
-    tokens_txt = Path(args.tokens_txt).expanduser().resolve()
-    tokens = read_tokens(tokens_txt)
-    if not tokens:
-        raise RuntimeError(f"No tokens found in: {tokens_txt}")
-
+    db_path = Path(args.db).expanduser().resolve()
+    tokens_path = Path(args.tokens).expanduser().resolve()
     out_dir = Path(args.out_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    db_paths = [Path(p) for p in sorted(glob(str(split_root / args.db_glob)))]
-    if not db_paths:
-        raise RuntimeError(f"No DB files found under {split_root} with glob {args.db_glob}")
+    if not db_path.exists():
+        raise FileNotFoundError(db_path)
+    if not tokens_path.exists():
+        raise FileNotFoundError(tokens_path)
 
-    # We’ll progressively remove tokens as we find them to avoid repeated work
-    remaining = list(tokens)
-    found_map: Dict[str, str] = {}
+    tokens = read_tokens(tokens_path)
+    print(f"[INFO] Read {len(tokens)} unique tokens from {tokens_path}")
 
-    print(f"[INFO] split_root={split_root}")
-    print(f"[INFO] tokens_in={len(tokens)} (deduped)")
-    print(f"[INFO] db_files={len(db_paths)}")
+    conn = sqlite3.connect(str(db_path))
+    try:
+        scene_table = choose_scene_table(conn)
+        scene_log_fk_col, log_name_col = choose_log_join_columns(conn, scene_table)
 
-    for i, dbp in enumerate(db_paths):
-        if not remaining:
-            break
-        print(f"[INFO] ({i+1}/{len(db_paths)}) scanning {dbp.name} ... remaining={len(remaining)}")
-        m = fetch_pairs_from_db(dbp, remaining)
-        if m:
-            found_map.update(m)
-            found_set = set(m.keys())
-            remaining = [t for t in remaining if t not in found_set]
+        print(f"[INFO] Using scene/scenario table: {scene_table}")
+        print(f"[INFO] Join columns: {scene_table}.{scene_log_fk_col} -> log.token, log.{log_name_col} as log_name")
 
-    # Preserve original token order for outputs
-    pairs: List[List[str]] = []
-    for t in tokens:
-        ln = found_map.get(t, None)
-        if ln is not None:
+        token_to_log = build_token_to_logname(conn, scene_table, scene_log_fk_col, log_name_col)
+        print(f"[INFO] Built token->log_name map for {len(token_to_log)} rows from DB")
+
+        pairs: List[List[str]] = []
+        missing = []
+        for t in tokens:
+            ln = token_to_log.get(t)
+            if ln is None:
+                missing.append(t)
+                continue
             pairs.append([ln, t])
 
-    missing = [t for t in tokens if t not in found_map]
+        if missing:
+            msg = f"[WARN] {len(missing)} / {len(tokens)} tokens not found in DB."
+            if args.strict:
+                raise RuntimeError(msg + " Use without --strict to write the found subset.")
+            print(msg)
+            print("[WARN] First 10 missing tokens:", missing[:10])
 
-    # Write outputs
-    json_path = out_dir / "scenario_tokens.json"
-    txt_path = out_dir / "scenario_tokens.txt"
-    missing_path = out_dir / "missing_tokens.txt"
+        # Write outputs
+        json_path = out_dir / "scenario_tokens.json"
+        tsv_path = out_dir / "scenario_tokens.tsv"
 
-    json_path.write_text(json.dumps(pairs, indent=2))
-    with txt_path.open("w") as f:
-        for ln, t in pairs:
-            f.write(f"{ln} {t}\n")
-    missing_path.write_text("\n".join(missing) + ("\n" if missing else ""))
+        with json_path.open("w") as f:
+            json.dump(pairs, f)
 
-    print("\n[SUMMARY]")
-    print(f"  found   : {len(pairs)}")
-    print(f"  missing : {len(missing)}")
-    print(f"  wrote   : {json_path}")
-    print(f"  wrote   : {txt_path}")
-    print(f"  wrote   : {missing_path}")
+        with tsv_path.open("w") as f:
+            for ln, t in pairs:
+                f.write(f"{ln}\t{t}\n")
+
+        # Stats
+        log_counts = Counter([p[0] for p in pairs])
+        print(f"[INFO] Wrote {len(pairs)} pairs to:")
+        print(f"       - {json_path}")
+        print(f"       - {tsv_path}")
+        print(f"[INFO] Unique logs in selection: {len(log_counts)}")
+        print("[INFO] Top 10 logs by count:")
+        for k, v in log_counts.most_common(10):
+            print(f"  {k}: {v}")
+
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":
