@@ -23,6 +23,7 @@ from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import csv
 import json
+from tqdm import tqdm
 
 
 # -----------------------
@@ -35,7 +36,6 @@ def list_tables(conn: sqlite3.Connection) -> Set[str]:
 
 def table_columns(conn: sqlite3.Connection, table: str) -> Set[str]:
     cur = conn.execute(f"PRAGMA table_info({table})")
-    # PRAGMA table_info returns: cid, name, type, notnull, dflt_value, pk
     return {r[1] for r in cur.fetchall()}
 
 
@@ -47,10 +47,8 @@ def first_existing_table(tables: Set[str], candidates: Sequence[str]) -> Optiona
 
 
 def choose_token_column(cols: Set[str]) -> Optional[str]:
-    # scenario token column is usually 'token' in nuPlan DBs
     if "token" in cols:
         return "token"
-    # fallback names if schema differs
     for c in ["scenario_token", "scene_token", "id_token"]:
         if c in cols:
             return c
@@ -58,7 +56,6 @@ def choose_token_column(cols: Set[str]) -> Optional[str]:
 
 
 def choose_log_token_column(cols: Set[str]) -> Optional[str]:
-    # typical linking column from scenario/scene -> log
     for c in ["log_token", "log_id", "log"]:
         if c in cols:
             return c
@@ -66,17 +63,12 @@ def choose_log_token_column(cols: Set[str]) -> Optional[str]:
 
 
 def choose_log_table_and_namecol(conn: sqlite3.Connection, tables: Set[str]) -> Optional[Tuple[str, str, str]]:
-    """
-    Returns (log_table, log_token_col, log_name_col) if possible.
-    Common: log(token, log_name)
-    """
     if "log" not in tables:
         return None
     cols = table_columns(conn, "log")
-    # token column in log table
+
     log_token_col = "token" if "token" in cols else None
     if log_token_col is None:
-        # rare fallback
         for c in ["log_token", "id", "uuid"]:
             if c in cols:
                 log_token_col = c
@@ -84,7 +76,6 @@ def choose_log_table_and_namecol(conn: sqlite3.Connection, tables: Set[str]) -> 
     if log_token_col is None:
         return None
 
-    # name column in log table
     log_name_col = None
     for c in ["log_name", "name", "logfile", "filename"]:
         if c in cols:
@@ -100,9 +91,6 @@ def find_mapping_in_db(
     db_path: Path,
     wanted_tokens: Set[str],
 ) -> Dict[str, str]:
-    """
-    Return mapping token -> log_name found in this DB.
-    """
     out: Dict[str, str] = {}
     if not wanted_tokens:
         return out
@@ -112,17 +100,15 @@ def find_mapping_in_db(
     try:
         tables = list_tables(conn)
 
-        # Pick scenario-like table
         scen_table = first_existing_table(tables, ["scenario", "scene"])
         if scen_table is None:
-            # Heuristic: find any table that has 'token' and *some* log link
             for t in sorted(tables):
                 cols = table_columns(conn, t)
                 if "token" in cols and any(k in cols for k in ["log_token", "log_id", "log"]):
                     scen_table = t
                     break
         if scen_table is None:
-            return out  # not a scenario DB (or schema too different)
+            return out
 
         scen_cols = table_columns(conn, scen_table)
         token_col = choose_token_column(scen_cols)
@@ -135,7 +121,6 @@ def find_mapping_in_db(
             return out
         log_table, log_token_col, log_name_col = log_info
 
-        # SQLite IN clause max vars is often 999; batch it
         wanted_list = list(wanted_tokens)
         B = 900
 
@@ -143,9 +128,6 @@ def find_mapping_in_db(
             chunk = wanted_list[i : i + B]
             qmarks = ",".join(["?"] * len(chunk))
 
-            # Join scenario/scene -> log to get log_name
-            # Handle log_link_col being log_id-like vs token-like:
-            # Most nuPlan DBs use log_token and log.token.
             query = f"""
                 SELECT s.{token_col} AS scen_token, l.{log_name_col} AS log_name
                 FROM {scen_table} s
@@ -156,13 +138,10 @@ def find_mapping_in_db(
             try:
                 rows = conn.execute(query, chunk).fetchall()
             except sqlite3.OperationalError:
-                # If join failed (schema mismatch), give up for this DB
                 return out
 
             for r in rows:
-                tok = str(r["scen_token"])
-                ln = str(r["log_name"])
-                out[tok] = ln
+                out[str(r["scen_token"])] = str(r["log_name"])
 
         return out
 
@@ -177,10 +156,8 @@ def read_tokens_file(path: Path) -> List[str]:
     toks: List[str] = []
     for line in path.read_text().splitlines():
         t = line.strip()
-        if not t:
-            continue
-        toks.append(t)
-    # de-dupe but preserve order
+        if t:
+            toks.append(t)
     seen = set()
     out = []
     for t in toks:
@@ -192,10 +169,10 @@ def read_tokens_file(path: Path) -> List[str]:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--split", required=True, help="Split name, e.g. mini, trainval")
-    ap.add_argument("--tokens", required=True, type=str, help="tokens.txt with one scenario token per line")
-    ap.add_argument("--out_dir", required=True, type=str, help="Output directory")
-    ap.add_argument("--db_glob", default="*.db", help="Glob for DB files inside split dir (default: *.db)")
+    ap.add_argument("--split", required=True)
+    ap.add_argument("--tokens", required=True, type=str)
+    ap.add_argument("--out_dir", required=True, type=str)
+    ap.add_argument("--db_glob", default="*.db")
     args = ap.parse_args()
 
     data_root = os.environ.get("NUPLAN_DATA_ROOT", None)
@@ -208,23 +185,18 @@ def main():
 
     db_files = sorted(split_dir.glob(args.db_glob))
     if not db_files:
-        raise FileNotFoundError(f"No DB files found in {split_dir} with glob '{args.db_glob}'")
+        raise FileNotFoundError(f"No DB files found in {split_dir}")
 
     out_dir = Path(args.out_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
     tokens = read_tokens_file(Path(args.tokens))
-    wanted = set(tokens)
-
-    print(f"[INFO] split_dir: {split_dir}")
-    print(f"[INFO] #db_files: {len(db_files)}")
-    print(f"[INFO] #wanted_tokens: {len(tokens)}")
+    remaining = set(tokens)
 
     token_to_log: Dict[str, str] = {}
     per_db_found: List[Tuple[str, int]] = []
 
-    remaining = set(tokens)
-    for db in db_files:
+    for db in tqdm(db_files, desc="Scanning DB files", unit="db"):
         if not remaining:
             break
         m = find_mapping_in_db(db, remaining)
@@ -232,16 +204,6 @@ def main():
         token_to_log.update(m)
         remaining -= set(m.keys())
 
-    found = len(token_to_log)
-    missing = [t for t in tokens if t not in token_to_log]
-
-    print(f"[INFO] Found: {found} / {len(tokens)}")
-    print(f"[INFO] Missing: {len(missing)}")
-    print("[INFO] Per-DB hits (top 15):")
-    for name, cnt in sorted(per_db_found, key=lambda x: x[1], reverse=True)[:15]:
-        print(f"  {name}: {cnt}")
-
-    # Write outputs
     csv_path = out_dir / "selected_scenarios.csv"
     jsonl_path = out_dir / "selected_scenarios.jsonl"
     missing_path = out_dir / "missing_tokens.txt"
@@ -259,25 +221,18 @@ def main():
             if t in token_to_log:
                 f.write(json.dumps({"log_name": token_to_log[t], "token": t}) + "\n")
 
+    missing = [t for t in tokens if t not in token_to_log]
     missing_path.write_text("\n".join(missing) + ("\n" if missing else ""))
 
     summary = {
         "split": args.split,
-        "split_dir": str(split_dir),
         "db_files": len(db_files),
         "wanted_tokens": len(tokens),
-        "found": found,
+        "found": len(token_to_log),
         "missing": len(missing),
         "per_db_found": [{"db": n, "count": c} for n, c in per_db_found],
-        "outputs": {
-            "csv": str(csv_path),
-            "jsonl": str(jsonl_path),
-            "missing_tokens": str(missing_path),
-        },
     }
     stats_path.write_text(json.dumps(summary, indent=2) + "\n")
-
-    print(f"[DONE] Wrote:\n  {csv_path}\n  {jsonl_path}\n  {missing_path}\n  {stats_path}")
 
 
 if __name__ == "__main__":
