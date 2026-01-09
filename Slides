@@ -1,0 +1,198 @@
+Slide 1 — Goal of the Project
+	•	Convert the PLUTO planner into the EMoE-Planner framework
+	•	Add scenario-aware specialization using:
+	•	Scene classification
+	•	Anchor-based multimodal motion predictions
+	•	Expert routing module
+	•	Train the modified EMoE planner end-to-end on nuPlan dataset
+	•	Evaluate planning and prediction performance vs baseline PLUTO
+
+⸻
+
+Slide 2 — Recap: PLUTO Architecture
+	•	PLUTO = single model, single decoder, fixed number of trajectory modes
+	•	One encoder extracts features (maps, agents, ego)
+	•	Decoder predicts multiple trajectories
+	•	No explicit routing based on scenario type
+	•	All scenarios treated equally → suboptimal behaviour on rare maneuvers
+
+⸻
+
+Slide 3 — EMoE Concept
+	•	Replace PLUTO’s single decoder with multiple experts
+	•	A router network selects experts based on scene type
+	•	Scene-dependent anchor trajectories guide decoder queries
+	•	Allows specialization:
+	•	Right turns handled by one expert
+	•	Roundabouts handled by another
+	•	Straight driving handled differently
+	•	Expected outcome: better accuracy + fewer collisions
+
+⸻
+
+Slide 4 — Designing Scene Classes
+	•	Analysed nuPlan scenarios using map & geometry heuristics
+	•	Defined 6 high-level driving categories
+	1.	Left turn
+	2.	Right turn
+	3.	Straight intersection
+	4.	Straight non-intersection
+	5.	U-turn
+	6.	Roundabout
+	•	Ran classification across all scenarios → stored labels
+
+⸻
+
+Slide 5 — Data Products Created
+	•	scene_labels.jsonl
+	•	Stores scenario token + class ID
+	•	anchors.npy
+	•	K-means clustering of ground truth endpoints
+	•	24 anchors per class → 6 × 24 = 144 anchors
+	•	Output integrated into PLUTO training pipeline
+
+⸻
+
+Slide 6 — EMoE Model Modifications
+	•	Added routing head to predict scene class
+	•	Extended planning decoder to:
+	•	Load anchor embeddings
+	•	Query experts using anchor directions
+	•	Output multimodal trajectories
+	•	Removed unused PLUTO heads (or adapted them)
+	•	Ensured training and inference share same architecture
+
+⸻
+
+Slide 7 — Pipeline Integration Work
+	•	Modified PLUTO feature builder to include:
+	•	Scene class IDs
+	•	Anchor selection
+	•	Added custom scenario splitter to control train/val sets
+	•	Rewired training builder to load only labeled scenarios
+	•	Verified scenario cache compatibility
+
+⸻
+
+Slide 8 — Early Errors Encountered
+
+1. YAML / Hydra configuration errors
+	•	Missing configs
+	•	Wrong run outputs
+	•	Fixed by reorganizing config search paths & output dirs
+
+2. Shape + Dimension mismatches
+	•	(B, K, T, D) not matching targets
+	•	Experts vs modes confusion
+	•	Fixed by aligning model horizon, mode counts, shapes
+
+3. Missing state dict keys
+	•	Caused by leftover PLUTO layers
+	•	Fixed by removing unused heads or adding matching modules
+
+⸻
+
+Slide 9 — Critical Runtime Errors Fixed
+
+CUDA device assertions
+	•	Root cause: invalid labels or tensor shapes
+	•	Solution: label checks + verifying router targets
+
+NaN explosions during training
+	•	Gradient spikes
+	•	Mismatched losses / masks
+	•	Solutions:
+	•	Gradient clipping
+	•	Lower LR and warmup
+	•	Masking invalid samples
+	•	Checking collision map inputs
+
+“Emergency Brake” in simulation
+	•	Planned trajectories collapsed
+	•	Caused by wrong output shapes and scaling
+	•	Fixed by validating decoder outputs per mode
+
+⸻
+
+Slide 10 — Current Working State
+	•	Training runs end-to-end without crashing
+	•	Checkpoints saved properly
+	•	Simulation runs with EMoE model
+	•	Initial metrics behaving reasonably:
+	•	minADE/minFDE decreasing slowly
+	•	Router class predictions show variation across scenes
+	•	First complete EMoE training + inference pipeline achieved
+
+⸻
+
+Slide 11 — Current Performance Results
+
+(Example language; adjust with real numbers)
+	•	val/minADE: ~11–13
+	•	val/minFDE: ~22–25
+	•	val/MR: ~0.20–0.30
+	•	PredAvg metrics slightly higher (expected)
+	•	Compare with PLUTO baseline numbers if available
+
+Interpretation:
+	•	Model is learning
+	•	Still far from convergence
+	•	Needs more clean data + tuning
+
+⸻
+
+Slide 12 — Remaining Issues
+	•	NaN still appears when:
+	•	Batch contains extreme trajectories
+	•	Router confidence saturates
+	•	Collision loss inputs misbehave
+	•	Overfitting risk due to limited scenarios
+	•	Simulation sometimes brakes excessively
+	•	Metric discrepancy indicates decoder not fully aligned
+
+⸻
+
+Slide 13 — Immediate Next Steps (Technical)
+	•	Stabilize training:
+	•	Lower learning rate further
+	•	Increase warmup steps
+	•	Clip gradient norms more aggressively
+	•	Add NaN guards in all loss terms
+	•	Double-check:
+	•	Anchor quality
+	•	Scale of trajectory coordinates
+	•	Future horizon alignment
+
+⸻
+
+Slide 14 — Medium-Term Plans
+	•	Increase dataset size and diversity
+	•	Add auxiliary tasks:
+	•	Agent intent prediction
+	•	Lane centerline following
+	•	Speed regularization
+	•	Introduce uncertainty calibration to router
+	•	Investigate soft vs hard expert routing
+
+⸻
+
+Slide 15 — Long-Term Ambitions
+	•	Achieve or surpass PLUTO baseline metrics
+	•	Run large-scale training (1M samples) on cluster
+	•	Submit planner to full nuPlan closed-loop benchmark
+	•	Explore:
+	•	Diffusion-based planners (PlanR, DiffDrive)
+	•	Hybrid MDP + EMoE planning
+
+⸻
+
+Slide 16 — Contribution Summary
+	•	Designed complete scene-aware EMoE pipeline
+	•	Implemented:
+	•	Scenario classifier
+	•	Anchors clustering
+	•	Router + multi-expert decoder
+	•	End-to-end training & simulation support
+	•	Debugged dozens of integration failures
+	•	Achieved first EMoE training loops and simulation
+	•	Foundation laid for performance optimization
