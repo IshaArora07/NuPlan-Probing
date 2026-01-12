@@ -28,7 +28,8 @@ def quoted_presenter(dumper, data):
     return dumper.represent_scalar("tag:yaml.org,2002:str", data, style='"')
 
 
-yaml.add_representer(Quoted, quoted_presenter)
+# IMPORTANT: register for SafeDumper (used by yaml.safe_dump)
+yaml.SafeDumper.add_representer(Quoted, quoted_presenter)
 
 
 # ----------------------------------------------------------------------
@@ -76,7 +77,7 @@ def main():
             f"--num-splits ({args.num_splits}) cannot exceed total tokens ({total})"
         )
 
-    # Compute split sizes as even as possible
+    # Compute split sizes as evenly as possible
     base = total // args.num_splits
     rem = total % args.num_splits
 
@@ -96,6 +97,7 @@ def main():
         part_tokens = tokens[start_idx:end_idx]
 
         data_part = deepcopy(data)
+        # Force double-quoted strings for tokens
         data_part[args.key] = [Quoted(str(t)) for t in part_tokens]
 
         out_path = f"{args.out_prefix}_part{i+1}.yaml"
