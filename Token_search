@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# search_token_in_dbs.sh
+#
+# Usage:
+#   ./search_token_in_dbs.sh <TOKEN> <DB_DIR>
+#
+# Example:
+#   ./search_token_in_dbs.sh 09ca86cc9ae65428 /home/you/nuplan-v1.1/splits/trainval
+
+set -e
+
+if [ "$#" -ne 2 ]; then
+  echo "Usage: $0 <SCENARIO_TOKEN> <DB_DIRECTORY>"
+  exit 1
+fi
+
+TOKEN="$1"
+DB_DIR="$2"
+
+if [ ! -d "$DB_DIR" ]; then
+  echo "Error: directory '$DB_DIR' does not exist."
+  exit 1
+fi
+
+if ! command -v sqlite3 >/dev/null 2>&1; then
+  echo "Error: sqlite3 is not installed or not in PATH."
+  exit 1
+fi
+
+found_any=0
+
+for db in "$DB_DIR"/*.db; do
+  # Skip if glob didn't match anything
+  [ -e "$db" ] || continue
+
+  hit=$(sqlite3 "$db" "SELECT COUNT(*) FROM scenario WHERE scenario_token = '$TOKEN';")
+  if [ "$hit" != "0" ]; then
+    echo "Found token $TOKEN in: $db  (rows: $hit)"
+    found_any=1
+  fi
+done
+
+if [ "$found_any" -eq 0 ]; then
+  echo "Token $TOKEN not found in any .db under $DB_DIR"
+fi
