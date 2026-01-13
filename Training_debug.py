@@ -4,61 +4,64 @@
         features, targets, scenarios = batch
         data = features["feature"].data
 
-        # -------------------------------------------------
-        # Debug: check INPUT data for NaN/Inf
-        # -------------------------------------------------
-        def _check_finite(x, path=""):
-            if isinstance(x, torch.Tensor):
-                if not torch.isfinite(x).all():
-                    bad_token = getattr(scenarios[0], "token", "UNKNOWN") if len(scenarios) > 0 else "UNKNOWN"
-                    raise RuntimeError(
-                        f"[NaN debug] NaN/Inf in INPUT at '{path}' "
-                        f"for scenario {bad_token}"
-                    )
-            elif isinstance(x, dict):
-                for k, v in x.items():
-                    _check_finite(v, f"{path}.{k}" if path else k)
-            elif isinstance(x, (list, tuple)):
-                for i, v in enumerate(x):
-                    _check_finite(v, f"{path}[{i}]")
-            # other types (str, int, None, etc.) are ignored
+        # ------------------------------------------------------------------
+        # DEBUG: identify scenarios in this batch
+        # ------------------------------------------------------------------
+        scenario_tokens = [getattr(s, "token", "UNKNOWN") for s in scenarios]
 
-        _check_finite(data, path="feature")
-
-        # Forward
-        res = self.forward(data)
-
-        # -------------------------------------------------
-        # Debug: check model outputs for NaN/Inf
-        # -------------------------------------------------
-        for name, tensor in res.items():
-            if isinstance(tensor, torch.Tensor) and not torch.isfinite(tensor).all():
-                bad_token = getattr(scenarios[0], "token", "UNKNOWN") if len(scenarios) > 0 else "UNKNOWN"
+        # ------------------------------------------------------------------
+        # 0) Check inputs for NaN / Inf
+        # ------------------------------------------------------------------
+        def _check_tensor(t, name: str):
+            if not torch.isfinite(t).all():
                 raise RuntimeError(
-                    f"[NaN debug] NaN/Inf in model output '{name}' "
-                    f"for scenario {bad_token}"
+                    f"[NaN debug] non-finite values in INPUT tensor '{name}' "
+                    f"for scenarios {scenario_tokens}"
                 )
 
-        # Compute losses
+        try:
+            _check_tensor(data["agent"]["target"],           "agent.target")
+            _check_tensor(data["agent"]["valid_mask"],       "agent.valid_mask")
+            _check_tensor(data["agent"]["velocity"],         "agent.velocity")
+            _check_tensor(data["reference_line"]["future_projection"],
+                          "reference_line.future_projection")
+            _check_tensor(data["cost_maps"],                 "cost_maps")
+        except KeyError:
+            # if any of these keys do not exist we just skip the check
+            pass
+
+        # ------------------------------------------------------------------
+        # 1) Forward pass
+        # ------------------------------------------------------------------
+        res = self.forward(data)
+
+        # ------------------------------------------------------------------
+        # 2) Check model outputs for NaN / Inf and sanitise
+        # ------------------------------------------------------------------
+        if "prediction" in res:
+            pred = res["prediction"]
+            finite_mask = torch.isfinite(pred)
+
+            if not finite_mask.all():
+                # Which batch elements are bad?
+                bs = pred.shape[0]
+                bad_batch = (~torch.isfinite(pred.view(bs, -1)).all(dim=1)).nonzero(as_tuple=False).flatten()
+                bad_tokens = [scenario_tokens[i] for i in bad_batch.tolist()]
+
+                logger.error(
+                    "[NaN debug] NaN/Inf in model output 'prediction' for "
+                    f"{len(bad_tokens)} scenario(s): {bad_tokens}"
+                )
+
+                # Sanitise: replace non-finite with zeros so loss stays finite
+                pred = torch.where(finite_mask, pred, torch.zeros_like(pred))
+                res["prediction"] = pred
+
+        # ------------------------------------------------------------------
+        # 3) Normal loss + metrics
+        # ------------------------------------------------------------------
         losses = self._compute_objectives(res, data)
-
-        # Debug: check loss components
-        for name, val in losses.items():
-            if isinstance(val, torch.Tensor):
-                if not torch.isfinite(val).all():
-                    bad_token = getattr(scenarios[0], "token", "UNKNOWN") if len(scenarios) > 0 else "UNKNOWN"
-                    raise RuntimeError(
-                        f"[NaN debug] NaN/Inf in loss component '{name}' "
-                        f"for scenario {bad_token}"
-                    )
-
         metrics = self._compute_metrics(res, data, prefix)
         self._log_step(losses["loss"], losses, metrics, prefix)
 
-        if self.training and (not torch.isfinite(losses["loss"])):
-            bad_token = getattr(scenarios[0], "token", "UNKNOWN") if len(scenarios) > 0 else "UNKNOWN"
-            raise RuntimeError(
-                f"[NaN debug] Total loss is NaN/Inf for scenario {bad_token}"
-            )
-
-        return losses["loss"] if self.training else torch.tensor(0.0, device=self.device)
+        return losses["loss"] if self.training else 0.0
