@@ -65,3 +65,98 @@
         self._log_step(losses["loss"], losses, metrics, prefix)
 
         return losses["loss"] if self.training else 0.0
+
+
+
+
+
+
+
+
+    # ----------------------------------------------------------------------
+    # NEW: helper to log tokens that caused non-finite loss
+    # ----------------------------------------------------------------------
+    def _log_bad_tokens(self, scenario_tokens, reason: str, prefix: str) -> None:
+        """
+        Append bad scenario tokens to a text file and log via logger.
+        """
+        if not scenario_tokens:
+            return
+
+        # Update in-memory set
+        for t in scenario_tokens:
+            if t is not None:
+                self.bad_tokens.add(str(t))
+
+        # Log to file
+        try:
+            with open(self.bad_token_log_path, "a") as f:
+                for t in scenario_tokens:
+                    if t is None:
+                        continue
+                    f.write(f"{prefix}\t{reason}\t{str(t)}\n")
+        except Exception as e:
+            logger.error(f"Failed to write bad tokens to {self.bad_token_log_path}: {e}")
+
+        # Also log a summary line
+        logger.warning(
+            "[LightningTrainer] Skipping batch (%s) due to %s; tokens: %s",
+            prefix,
+            reason,
+            ", ".join(str(t) for t in scenario_tokens if t is not None),
+        )
+
+
+
+
+
+
+
+    def _step(
+        self, batch: Tuple[FeaturesType, TargetsType, ScenarioListType], prefix: str
+    ) -> torch.Tensor:
+        features, targets, scenarios = batch
+
+        # ------------------------------------------------------------------
+        # NEW: Early skip if this batch contains tokens already known as bad
+        # ------------------------------------------------------------------
+        scenario_tokens = []
+        for sc in scenarios:
+            tok = getattr(sc, "token", None)
+            scenario_tokens.append(tok)
+
+        # If you want to completely skip any batch that *contains* a known
+        # bad token, keep this; otherwise you can remove this block.
+        if any((t is not None and str(t) in self.bad_tokens) for t in scenario_tokens):
+            self._log_bad_tokens(scenario_tokens, reason="skip_known_bad", prefix=prefix)
+            # Return a zero loss tensor that still has grad so Lightning is happy
+            return torch.tensor(0.0, device=self.device, requires_grad=True)
+
+        # ------------------------------------------------------------------
+        # Normal forward + loss
+        # ------------------------------------------------------------------
+        data = features["feature"].data
+        res = self.forward(data)
+
+        # Compute objectives first
+        losses = self._compute_objectives(res, data)
+
+        total_loss = losses["loss"]
+
+        # ------------------------------------------------------------------
+        # NEW: detect non-finite loss and skip batch
+        # ------------------------------------------------------------------
+        if not torch.isfinite(total_loss):
+            # Log and remember these tokens
+            self._log_bad_tokens(scenario_tokens, reason="nan_or_inf_loss", prefix=prefix)
+
+            # Return a zero loss whose backward is well-defined
+            return torch.tensor(0.0, device=self.device, requires_grad=True)
+
+        # Only compute metrics if loss is finite
+        metrics = self._compute_metrics(res, data, prefix)
+        self._log_step(total_loss, losses, metrics, prefix)
+
+        return total_loss if self.training else torch.tensor(0.0, device=self.device)
+
+
