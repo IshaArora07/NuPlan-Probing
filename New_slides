@@ -1,0 +1,334 @@
+Below is a complete slide-deck outline, detailed bullet content, with explicit placeholders for graphs, screenshots, and logs.
+
+It covers:
+	1.	Start of training → early smooth run
+	2.	200K natural distribution
+	3.	Class-4/5 explosion & self-attention backprop errors
+	4.	Disabling attention / detaching
+	5.	Router loss = 0
+	6.	PredAvgFDE → NaN
+	7.	What debugging you did and which fixes worked
+	8.	Future plans (A–I), mapped to your code files
+
+======================================================================
+
+SLIDE 1 — EMoE Training: What I did from Day 1 to Today
+
+Subtitle: Converting PLUTO into Explicit Mixture-of-Experts
+Name + thesis title + date
+
+⸻
+
+SLIDE 2 — Initial Aim
+
+Goal
+	•	Replace PLUTO monolithic decoder with EMoE architecture
+	•	Condition planning on:
+	•	Scenario class (6 categories)
+	•	Learned anchors
+	•	Routing mechanism shared across modules
+	•	Train on nuPlan → start small → scale to full trainval
+
+[INSERT ARCHITECTURE BLOCK DIAGRAM]
+
+⸻
+
+SLIDE 3 — Data Labeling & Anchors
+
+Steps completed
+	•	Wrote scene classification pipeline: tags → map semantics → geometric headings
+	•	Stored:
+	•	scene_labels.jsonl — token, class_id, endpoint
+	•	anchors.npy — shape [6, 24, 2]
+	•	Verified class distribution
+
+[INSERT BAR PLOT OF SCENE COUNTS]
+[INSERT SAMPLE JSON AND ANCHOR PRINT]
+
+⸻
+
+SLIDE 4 — First Mini Run (≈50 scenarios)
+
+Outcome
+	•	Feature caching worked
+	•	Training completed 25 epochs in ~2 minutes
+	•	Losses reduced → validated code correctness end-to-end
+
+[INSERT LOSS CURVES FROM MINI RUN]
+[INSERT TABLE: minADE, minFDE, MR]
+
+⸻
+
+SLIDE 5 — Scaling to Natural Distribution (≈200K)
+
+Switch from manually sampled subset → natural distribution
+	•	Included data from all maps
+	•	Batch sizes tuned for GPU memory
+	•	Caching complete for the entire dataset
+	•	No errors initially → smooth first epochs
+
+[INSERT GPU UTILISATION SNAPSHOT]
+[INSERT TRAIN/VAL METRIC CURVES EARLY EPOCHS]
+
+⸻
+
+SLIDE 6 — Class 4 & 5 Imbalance Reveals Failures
+
+What happened
+	•	Two rare classes (roundabout/U-turn) suddenly large due to full dataset
+	•	Router forced to propagate gradients into undertrained experts
+	•	Backprop through attention exploded
+
+Symptom
+	•	RuntimeError in backprop:
+	•	nan gradients
+	•	Invalid tensor sizes
+	•	Occasionally CUDA illegal memory access
+	•	Router Loss = 0 → indicates model routing every sample to one expert
+
+[INSERT STACKTRACE SNIPPET OF SELF-ATTENTION ERROR]
+[INSERT HEATMAP SHOWING CLASS DISTRIBUTION]
+
+⸻
+
+SLIDE 7 — Why Self-Attention Broke
+
+Root Cause
+	•	SceneModeQueryGeneratorSoft and PlanningDecoder depend on attention to mix shared + expert features
+	•	Underrepresented classes = unstable gradients
+	•	When large influx of class 4/5 samples arrived:
+	•	Experts lacked pretrained weights
+	•	Attention weights saturated → produced infinities
+	•	Backprop hit undefined derivatives
+
+Effect
+	•	Routing collapsed to a single expert
+	•	Router loss stopped learning (→ zero)
+	•	Experts 4–5 contributed pathological gradients → corrupting others
+
+[INSERT ROUTER PROBABILITIES PER EXPERT PLOT]
+
+⸻
+
+SLIDE 8 — Fix Attempt: Disable / Detach Self-Attention
+
+What I did
+	•	Bypassed attention or:
+	•	Detach attention output from computation graph
+	•	Eventually removed soft-attention mixing completely
+
+Impact
+	•	No gradient flows through attention
+	•	Router and experts trained independently without mixing
+	•	Eliminated backprop instability
+
+Trade-off
+	•	Model cannot blend expert knowledge
+	•	Routing becomes harder (because experts must learn distinct behaviour)
+	•	Performance degradation expected in complex scenes
+
+[INSERT BEFORE/AFTER LOSS CURVES]
+[INSERT CODE SNIPPET SHOWING DETACH]
+
+⸻
+
+SLIDE 9 — Router Loss = 0 and Why It Happened
+
+Reason
+	•	Cross-entropy cannot train if:
+	•	Router assigns all probability to one expert
+	•	Scene labels for many samples mismatch router prediction
+	•	Gradients become zero when logits saturate
+
+Mitigation Attempt
+	•	Normalizing logits
+	•	Forcing non-zero probability
+	•	Logging probabilities across experts
+
+[INSERT ROUTER PROB DISTRIBUTION OVER EPOCHS]
+
+⸻
+
+SLIDE 10 — PredAvgFDE → NaN
+
+Symptom
+	•	PredAvgFDE metric eventually returns NaN
+	•	Often happens in late epochs
+	•	Growth pattern: stable → oscillate → NaN → recover → collapse
+
+Root causes
+	•	Zero valid trajectories selected (edge batches)
+	•	Division by count=0 inside torchmetrics reduction
+	•	Interaction with soft expert mixing
+
+Fix
+	•	Skip invalid batches
+	•	Replace bad values by safe defaults
+	•	Defensive math (clamp small denominators)
+	•	Logging each batch to find responsible scenarios
+
+[INSERT PREDAVG CURVE WITH NaN REGION]
+
+⸻
+
+SLIDE 11 — Result of All Fixes (Current State)
+
+Current behaviour
+	•	Training now finishes execution
+	•	No hard crashes
+	•	NaNs largely suppressed
+	•	Experts slowly learning gated behaviour
+	•	Still missing:
+	•	Full routing separation
+	•	Stability at scale with attention
+
+[INSERT BEST CURRENT LOSS + METRICS]
+
+⸻
+
+SECTION 2 — WHAT YOU HAVE LEARNED
+
+SLIDE 12 — Key Technical Lessons
+	•	Scaling breaks assumptions
+	•	Rare classes amplify gradient instabilities
+	•	Router + attention are the weakest links
+	•	Losing attention removes expressive power
+	•	Defensive metrics are essential at scale
+
+⸻
+
+SECTION 3 — FUTURE PLANS (A–I IMPLEMENTATION PLAN)
+
+SLIDE 13 — Overview of Roadmap
+
+Three broad themes:
+	1.	Strengthen routing
+	2.	Refine anchors & supervision
+	3.	Add auxiliary signals and curricula
+
+[INSERT SIMPLE TIMELINE GRAPH]
+
+⸻
+
+SLIDE 14 — A) Better Mixture Gating
+
+Implement in:
+	•	scene_router.py
+	•	pluto_model.py
+	•	lightning_trainer.py
+
+Add:
+	•	Temperature to control softmax sharpness
+	•	Entropy penalty to avoid collapse
+	•	Hard/soft hybrid so experts specialize
+
+Why:
+	•	Prevent router collapse and 0-loss failure
+
+⸻
+
+SLIDE 15 — B–C) Anchors: Usage + Learning
+
+Files:
+	•	Anchor generator script
+	•	scene_mode_query.py
+
+Work:
+	•	Log anchor usage counts
+	•	Prune dead anchors
+	•	Add shared + residual learnable offsets
+
+Why:
+	•	Anchors adapt to real data rather than fixed KMeans
+
+⸻
+
+SLIDE 16 — D) Scene-Aware Prediction Heads
+
+Files:
+	•	interaction_pred_decoder.py
+
+Work:
+	•	Feed scene label embeddings into decoder
+	•	Optional per-scene output heads
+
+Why:
+	•	Prevent “one size fits all” trajectory logic
+
+⸻
+
+SLIDE 17 — E) Expert Dropout / Balancing
+
+Files:
+	•	scene_router.py
+	•	lightning_trainer.py
+
+Ideas:
+	•	Randomly disable experts (training only)
+	•	Penalise overuse of a single expert
+
+Goal:
+	•	Avoid collapse to Expert 0
+
+⸻
+
+SLIDE 18 — F) Driving-Quality Losses
+
+Files:
+	•	lightning_trainer.py
+
+Add:
+	•	Jerk / smoothness loss
+	•	Intersection blocking penalty
+
+Benefit:
+	•	Experts learn more than imitation
+
+⸻
+
+SLIDE 19 — G) Curriculum Training
+
+Approach:
+	•	Train easy classes first (straight / turn)
+	•	Inject class 4 & 5 gradually
+	•	Or two-run staged training
+
+Effect:
+	•	Avoid gradient shock when introducing hard scenes
+
+⸻
+
+SLIDE 20 — H–I) Rethink Labels & Add Aux Tasks
+
+Ideas:
+	•	Reassign anchors based on “best mode” during training
+	•	Train auxiliary classifier (turn direction)
+
+Why:
+	•	Strengthen supervision signal
+	•	Gradually correct noisy initial class labels
+
+⸻
+
+SLIDE 21 — Final Summary
+
+You achieved:
+	•	PLUTO → EMoE conversion
+	•	Data labeling, anchors & routing implemented
+	•	Debugged:
+	•	Attention instability
+	•	Router collapse
+	•	PredAvgFDE NaNs
+	•	Achieved stable full-dataset training
+	•	Now positioned for research novelty (A–I)
+
+[INSERT ONE SUMMARY GRAPH OF ALL METRICS]
+
+======================================================================
+
+If you want next:
+	•	Presenter notes per slide
+	•	Material to put in appendix
+	•	One-page contribution statement
+
+Ask: “Write presenter notes” or “Make appendix pages”.
