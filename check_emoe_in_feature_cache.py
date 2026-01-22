@@ -1,21 +1,6 @@
 #!/usr/bin/env python3
-"""
-Check whether nuPlan feature cache entries contain EMoE label fields.
-
-Strategy:
-  1) Locate nuPlan cache metadata CSV (e.g., cache_metadata*.csv).
-  2) Read feature artifact paths from the CSV.
-  3) For a sample (or all) entries, load the cached feature object/dict.
-  4) Check presence of: data["emoe"]["emoe_class_id"] (or common variants).
-
-Notes:
-- nuPlan cache layout is nested (log -> scenario_type -> token -> ...). Do not rely on *.pkl at root.
-- This script is conservative: it tries pickle and torch.load.
-"""
-
 import argparse
 import csv
-import json
 import pickle
 from collections import Counter
 from pathlib import Path
@@ -25,99 +10,36 @@ import torch
 
 
 def find_metadata_csv(cache_dir: Path) -> Path:
-    # Most robust: search for any csv with "cache" and "metadata" in its name
-    candidates = sorted(cache_dir.rglob("*.csv"))
-    scored = []
-    for p in candidates:
-        name = p.name.lower()
-        if "cache" in name and "meta" in name:
-            scored.append(p)
-    if scored:
-        return scored[0]
-
-    # fallback: if only one csv exists, use it
-    if len(candidates) == 1:
+    # Prefer cache_metadata*.csv
+    candidates = sorted(cache_dir.rglob("cache_metadata*.csv"))
+    if candidates:
         return candidates[0]
+    # fallback: any csv
+    candidates = sorted(cache_dir.rglob("*.csv"))
+    if candidates:
+        return candidates[0]
+    raise FileNotFoundError(f"No CSV metadata found under {cache_dir}")
 
-    raise FileNotFoundError(
-        f"Could not find cache metadata CSV under {cache_dir}. "
-        f"Found {len(candidates)} csv files total."
-    )
 
-
-def sniff_csv_columns(csv_path: Path) -> Tuple[str, Optional[str]]:
-    """
-    Returns (feature_col, token_col)
-    feature_col: column containing path to cached features (directory or file)
-    token_col: optional column containing scenario token
-    """
+def pick_path_column(csv_path: Path) -> Tuple[str, Optional[str]]:
     with csv_path.open("r", newline="") as f:
         reader = csv.DictReader(f)
-        fieldnames = reader.fieldnames or []
-    lower = {c.lower(): c for c in fieldnames}
+        cols = reader.fieldnames or []
 
-    # common variants across forks/versions
-    feature_candidates = [
-        "feature_path",
-        "features_path",
-        "features",
-        "feature",
-        "cached_feature_path",
-        "cache_feature_path",
-        "path_to_features",
-        "features_dir",
-    ]
-    token_candidates = ["token", "scenario_token", "scenario_id"]
+    # Most minimal metadata has only "file_name"
+    if "file_name" in cols:
+        return "file_name", ("token" if "token" in cols else None)
 
-    feature_col = None
-    for k in feature_candidates:
-        if k in lower:
-            feature_col = lower[k]
-            break
+    # Otherwise try common alternatives
+    for c in cols:
+        cl = c.lower()
+        if cl in {"feature_path", "features_path", "cached_feature_path", "path"}:
+            return c, ("token" if "token" in cols else None)
 
-    token_col = None
-    for k in token_candidates:
-        if k in lower:
-            token_col = lower[k]
-            break
-
-    if feature_col is None:
-        raise KeyError(
-            f"Could not identify feature-path column in {csv_path}. "
-            f"Columns: {fieldnames}"
-        )
-    return feature_col, token_col
+    raise KeyError(f"Could not identify artifact path column in {csv_path}. Columns: {cols}")
 
 
-def _try_load_feature_obj(path: Path) -> Any:
-    """
-    Try to load a cached feature artifact from a path that might be:
-      - a file (pickle / torch)
-      - a directory containing a file
-    Returns loaded object or raises.
-    """
-    if path.is_dir():
-        # look for likely files inside
-        # prefer files that include 'feature' in name
-        files = sorted([p for p in path.rglob("*") if p.is_file()])
-        if not files:
-            raise FileNotFoundError(f"No files under feature dir: {path}")
-
-        def score(p: Path) -> int:
-            n = p.name.lower()
-            s = 0
-            if "feature" in n:
-                s += 10
-            if n.endswith(".pkl") or n.endswith(".pickle"):
-                s += 5
-            if n.endswith(".pt") or n.endswith(".pth"):
-                s += 4
-            return -s  # sort ascending
-
-        files = sorted(files, key=score)
-        path = files[0]
-
-    # file load attempts
+def _try_load(path: Path) -> Any:
     # 1) pickle
     try:
         with path.open("rb") as f:
@@ -129,66 +51,51 @@ def _try_load_feature_obj(path: Path) -> Any:
     try:
         return torch.load(str(path), map_location="cpu")
     except Exception as e:
-        raise RuntimeError(f"Failed to load as pickle or torch: {path} ({e})")
+        raise RuntimeError(f"Cannot load {path} via pickle or torch.load: {e}")
 
 
-def _extract_data_dict(obj: Any) -> Optional[Dict[str, Any]]:
-    """
-    Extract the dict that should contain keys like agent/map/reference_line/emoe.
-    Handles:
-      - PlutoFeature-like objects with .data
-      - dict objects directly
-    """
-    if obj is None:
-        return None
-    if isinstance(obj, dict):
-        # sometimes stored as {"feature": <PlutoFeature>} or {"data": {...}}
-        if "data" in obj and isinstance(obj["data"], dict):
-            return obj["data"]
-        if "feature" in obj:
-            feat = obj["feature"]
-            if hasattr(feat, "data") and isinstance(feat.data, dict):
-                return feat.data
-        return obj
+def _extract_data(obj: Any) -> Optional[Dict]:
+    # PlutoFeature-like
     if hasattr(obj, "data") and isinstance(obj.data, dict):
         return obj.data
+    # raw dict
+    if isinstance(obj, dict):
+        if "data" in obj and isinstance(obj["data"], dict):
+            return obj["data"]
+        return obj
     return None
 
 
-def _has_emoe_class_id(data: Dict[str, Any]) -> bool:
-    if "emoe" not in data or not isinstance(data["emoe"], dict):
+def _has_emoe(data: Dict) -> bool:
+    em = data.get("emoe", None)
+    if not isinstance(em, dict):
         return False
-    em = data["emoe"]
-    # your code used emoe_class_id; support a few variants
     return any(k in em for k in ["emoe_class_id", "scene_label", "class_id", "scene_class_id"])
 
 
-def main(cache_dir: Path, max_items: int, max_print: int, verbose: bool):
+def main(cache_dir: Path, max_items: int, max_print: int):
     cache_dir = cache_dir.expanduser().resolve()
-    if not cache_dir.exists():
-        raise FileNotFoundError(cache_dir)
+    meta = find_metadata_csv(cache_dir)
+    print("[INFO] cache_dir:", cache_dir)
+    print("[INFO] metadata:", meta)
 
-    # quick inventory (helps diagnose wrong cache_dir)
+    path_col, token_col = pick_path_column(meta)
+    print("[INFO] artifact path column:", path_col)
+
+    # inventory helps: tells you what serializer/extension is used
     ext_counts = Counter()
     for p in cache_dir.rglob("*"):
         if p.is_file():
             ext_counts[p.suffix.lower()] += 1
-    print("[INFO] Cache inventory (top extensions):")
-    for ext, c in ext_counts.most_common(12):
+    print("\n[INFO] Cache inventory (top extensions):")
+    for ext, c in ext_counts.most_common(15):
         print(f"  {ext or '<no-ext>'}: {c}")
-
-    meta = find_metadata_csv(cache_dir)
-    print(f"\n[INFO] Using metadata CSV: {meta}")
-
-    feature_col, token_col = sniff_csv_columns(meta)
-    print(f"[INFO] Feature column: {feature_col}")
-    print(f"[INFO] Token column: {token_col}")
 
     ok = 0
     miss = 0
     load_fail = 0
-    examples_miss = []
-    examples_fail = []
+    ex_miss = []
+    ex_fail = []
 
     with meta.open("r", newline="") as f:
         reader = csv.DictReader(f)
@@ -196,88 +103,72 @@ def main(cache_dir: Path, max_items: int, max_print: int, verbose: bool):
             if max_items > 0 and i >= max_items:
                 break
 
-            raw_path = row.get(feature_col, "") or ""
-            raw_path = raw_path.strip()
-            if not raw_path:
+            rel = (row.get(path_col) or "").strip()
+            if not rel:
                 load_fail += 1
-                if len(examples_fail) < max_print:
-                    examples_fail.append(("EMPTY_FEATURE_PATH", row.get(token_col)))
+                if len(ex_fail) < max_print:
+                    ex_fail.append(("EMPTY_PATH", row.get(token_col)))
                 continue
 
-            feat_path = Path(raw_path)
-            if not feat_path.is_absolute():
-                # nuPlan metadata often stores relative paths; treat them as relative to cache_dir
-                feat_path = cache_dir / feat_path
+            artifact_path = Path(rel)
+            if not artifact_path.is_absolute():
+                artifact_path = cache_dir / artifact_path
 
-            token = row.get(token_col) if token_col else None
+            tok = row.get(token_col) if token_col else None
+
+            if not artifact_path.exists():
+                load_fail += 1
+                if len(ex_fail) < max_print:
+                    ex_fail.append((f"NOT_FOUND:{artifact_path}", tok))
+                continue
 
             try:
-                obj = _try_load_feature_obj(feat_path)
-                data = _extract_data_dict(obj)
-                if data is None or not isinstance(data, dict):
+                obj = _try_load(artifact_path)
+                data = _extract_data(obj)
+                if data is None:
                     load_fail += 1
-                    if len(examples_fail) < max_print:
-                        examples_fail.append((str(feat_path), token))
+                    if len(ex_fail) < max_print:
+                        ex_fail.append((f"NO_DATA_DICT:{artifact_path}", tok))
                     continue
 
-                has = _has_emoe_class_id(data)
-                if has:
+                if _has_emoe(data):
                     ok += 1
                 else:
                     miss += 1
-                    if len(examples_miss) < max_print:
-                        # try pull token from data if possible
-                        dtok = data.get("token") or data.get("scenario_token") or token
-                        examples_miss.append((str(feat_path), dtok, list(data.keys())[:20]))
-
-                if verbose and (i % 500 == 0):
-                    print(f"[PROGRESS] checked={i} ok={ok} miss={miss} load_fail={load_fail}")
+                    if len(ex_miss) < max_print:
+                        dtok = data.get("token") or data.get("scenario_token") or tok
+                        ex_miss.append((str(artifact_path), dtok, list(data.keys())[:20]))
 
             except Exception:
                 load_fail += 1
-                if len(examples_fail) < max_print:
-                    examples_fail.append((str(feat_path), token))
-                continue
+                if len(ex_fail) < max_print:
+                    ex_fail.append((f"LOAD_FAIL:{artifact_path}", tok))
 
-    total = ok + miss + load_fail
     print("\n========== SUMMARY ==========")
-    print(f"checked: {total}")
-    print(f"ok (has emoe class id): {ok}")
-    print(f"missing emoe: {miss}")
-    print(f"load failures: {load_fail}")
+    print("checked:", ok + miss + load_fail)
+    print("ok(has emoe):", ok)
+    print("missing emoe:", miss)
+    print("load_fail:", load_fail)
 
-    if examples_miss:
+    if ex_miss:
         print("\nExamples MISSING emoe (path, token, top-keys):")
-        for p, tok, keys in examples_miss:
-            print(" -", p, "token=", tok, "keys=", keys)
+        for p, t, keys in ex_miss:
+            print(" -", p, "token=", t, "keys=", keys)
 
-    if examples_fail:
-        print("\nExamples LOAD FAIL (path, token):")
-        for p, tok in examples_fail:
-            print(" -", p, "token=", tok)
+    if ex_fail:
+        print("\nExamples FAIL (path, token):")
+        for p, t in ex_fail:
+            print(" -", p, "token=", t)
 
-    # simple exit hint
     if ok == 0 and miss == 0:
-        print("\n[HINT] No entries could be loaded. Most common causes:")
-        print("  - wrong --cache_dir (pointing at experiment dir, not cache dir)")
-        print("  - metadata CSV points to paths not visible on this machine/mount")
-        print("  - cache files are not pickle/torch serialized (need custom loader)")
-    elif miss > 0:
-        print("\n[CONCLUSION] Your feature cache contains entries without emoe. "
-              "Those will crash any collate code that assumes f.data['emoe'] exists.")
-    else:
-        print("\n[CONCLUSION] All loaded cached features contained emoe. "
-              "If training still sees missing emoe, the issue is in the training dataloader path, not cache content.")
+        print("\n[HINT] None of the cache files could be deserialized with pickle/torch.load.")
+        print("       Look at the extensions inventory above and tell me the most common extension.")
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--cache_dir", required=True, help="nuPlan cache root (cfg.cache.cache_path)")
-    ap.add_argument("--max_items", type=int, default=2000,
-                    help="How many metadata rows to check (0 = all). Default 2000.")
-    ap.add_argument("--max_print", type=int, default=15,
-                    help="How many example failures to print.")
-    ap.add_argument("--verbose", action="store_true")
+    ap.add_argument("--cache_dir", required=True)
+    ap.add_argument("--max_items", type=int, default=5000, help="0 = all")
+    ap.add_argument("--max_print", type=int, default=20)
     args = ap.parse_args()
-
-    main(Path(args.cache_dir), args.max_items, args.max_print, args.verbose)
+    main(Path(args.cache_dir), args.max_items, args.max_print)
