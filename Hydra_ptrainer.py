@@ -1,44 +1,37 @@
 # +++ ADD: Hydra auxiliary supervision (Level 1) +++
-hydra_cfg = getattr(cfg, "hydra_heads", None)
-self.enable_hydra_aux = bool(hydra_cfg is not None and getattr(hydra_cfg, "enabled", True))
+# Enable via hyperparameter; default off unless explicitly passed
+self.use_hydra_aux = bool(getattr(self.hparams, "use_hydra_aux", False))
 
-if self.enable_hydra_aux:
-    # Rule-based teachers (Level 1: no map / no ESDF)
+if self.use_hydra_aux:
+    # Rule-based teachers (Level 1: no ESDF/map usage here)
     teacher_cfg = RuleTeacherConfig(
-        # If your traj[...,0:2] is not x,y, change these in config later
-        xy_indices=getattr(hydra_cfg, "xy_indices", (0, 1)),
-        dt=float(getattr(hydra_cfg, "dt", 0.5)),
-        max_step_distance=getattr(hydra_cfg, "max_step_distance", 15.0),
-        max_speed=getattr(hydra_cfg, "max_speed", None),
-        speed_index=getattr(hydra_cfg, "speed_index", None),
+        xy_indices=getattr(self.hparams, "hydra_xy_indices", (0, 1)),
+        dt=float(getattr(self.hparams, "hydra_dt", 0.5)),
+        max_step_distance=getattr(self.hparams, "hydra_max_step_distance", 15.0),
+        max_speed=getattr(self.hparams, "hydra_max_speed", None),
+        speed_index=getattr(self.hparams, "hydra_speed_index", None),
 
-        w_collision=float(getattr(hydra_cfg, "w_collision", 0.0)),  # Level 1 default = 0
-        w_offroad=float(getattr(hydra_cfg, "w_offroad", 0.0)),      # Level 1 default = 0
-        w_comfort=float(getattr(hydra_cfg, "w_comfort", 1.0)),
-        w_progress=float(getattr(hydra_cfg, "w_progress", -5.0)),
+        # Level 1: collision/offroad terms disabled by default
+        w_collision=float(getattr(self.hparams, "hydra_w_collision", 0.0)),
+        w_offroad=float(getattr(self.hparams, "hydra_w_offroad", 0.0)),
+        w_comfort=float(getattr(self.hparams, "hydra_w_comfort", 1.0)),
+        w_progress=float(getattr(self.hparams, "hydra_w_progress", -5.0)),
 
-        soft_feasibility=bool(getattr(hydra_cfg, "soft_feasibility", True)),
-        feasibility_softness=float(getattr(hydra_cfg, "feasibility_softness", 10.0)),
+        soft_feasibility=bool(getattr(self.hparams, "hydra_soft_feasibility", True)),
+        feasibility_softness=float(getattr(self.hparams, "hydra_feasibility_softness", 10.0)),
     )
     self.rule_teachers = RuleBasedTeachers(teacher_cfg)
 
-    # Hydra losses
     loss_cfg = HydraLossConfig(
-        w_feasibility=float(getattr(hydra_cfg, "loss_w_feasibility", 0.05)),
-        w_cost=float(getattr(hydra_cfg, "loss_w_cost", 0.10)),
-        w_progress=float(getattr(hydra_cfg, "loss_w_progress", 0.02)),
-        w_comfort=float(getattr(hydra_cfg, "loss_w_comfort", 0.02)),
-        w_rank=float(getattr(hydra_cfg, "loss_w_rank", 0.0)),
+        w_feasibility=float(getattr(self.hparams, "hydra_loss_w_feasibility", 0.05)),
+        w_cost=float(getattr(self.hparams, "hydra_loss_w_cost", 0.10)),
+        w_progress=float(getattr(self.hparams, "hydra_loss_w_progress", 0.02)),
+        w_comfort=float(getattr(self.hparams, "hydra_loss_w_comfort", 0.02)),
+        w_rank=float(getattr(self.hparams, "hydra_loss_w_rank", 0.0)),
 
-        use_focal_for_feas=bool(getattr(hydra_cfg, "use_focal_for_feas", False)),
-        focal_gamma=float(getattr(hydra_cfg, "focal_gamma", 2.0)),
-        focal_alpha=float(getattr(hydra_cfg, "focal_alpha", 0.25)),
-
-        huber_delta=float(getattr(hydra_cfg, "huber_delta", 1.0)),
-        mask_regression_by_feasibility=bool(getattr(hydra_cfg, "mask_regression_by_feasibility", True)),
-        feas_mask_threshold=float(getattr(hydra_cfg, "feas_mask_threshold", 0.5)),
-
-        enable_cost_uncertainty_nll=bool(getattr(hydra_cfg, "enable_cost_uncertainty_nll", False)),
+        huber_delta=float(getattr(self.hparams, "hydra_huber_delta", 1.0)),
+        mask_regression_by_feasibility=bool(getattr(self.hparams, "hydra_mask_regression_by_feasibility", True)),
+        feas_mask_threshold=float(getattr(self.hparams, "hydra_feas_mask_threshold", 0.5)),
     )
     self.hydra_losses = HydraLosses(loss_cfg)
 else:
@@ -49,46 +42,45 @@ else:
 
 
 
-# +++ ADD: Hydra auxiliary losses (Level 1) +++
-if self.enable_hydra_aux:
-    hydra_out = out.get("hydra_heads", None) if isinstance(out, dict) else None
-    traj = out["trajectory"] if isinstance(out, dict) else None
 
-    # Only compute if model actually returned head outputs
-    if (hydra_out is not None) and (traj is not None) and (self.rule_teachers is not None) and (self.hydra_losses is not None):
-        teacher = self.rule_teachers(traj, context=None)  # Level 1: no map/context
-        aux_losses = self.hydra_losses(hydra_out, teacher)
+# +++ ADD: Hydra auxiliary heads (Level 1) +++
+hydra_total = ego_reg_loss.new_zeros(())  # scalar tensor on correct device
+hydra_losses_dict = {}
 
-        # Add to total loss
-        loss = loss + aux_losses["loss_hydra_total"]
+if self.use_hydra_aux and (self.rule_teachers is not None) and (self.hydra_losses is not None):
+    hydra_out = res.get("hydra_heads", None)
 
-        # Logging (step + epoch)
-        self.log("train/hydra_total", aux_losses["loss_hydra_total"], on_step=True, on_epoch=True, prog_bar=False)
-        for k, v in aux_losses.items():
-            if k == "loss_hydra_total":
-                continue
-            self.log(f"train/{k}", v, on_step=True, on_epoch=True, prog_bar=False)
+    # Only compute if model returned head outputs
+    if hydra_out is not None:
+        # trajectory is (bs, 1, Ka, T, 6) -> use ego reference line index 0 => (bs, Ka, T, 6)
+        traj_all_modes = trajectory[:, 0]  # already sliced to train_num above
 
-        # Optional: quick teacher stats (useful for debugging)
-        self.log("train/teacher_feasible_rate", (teacher["feasibility"] >= 0.5).float().mean(), on_step=True, on_epoch=True, prog_bar=False)
+        teacher = self.rule_teachers(traj_all_modes, context=None)
+        aux = self.hydra_losses(hydra_out, teacher)
+
+        hydra_total = aux["loss_hydra_total"]
+        loss = loss + hydra_total
+
+        # Keep individual aux losses for logging via objectives
+        hydra_losses_dict = aux
 # --- END ---
 
 
 
 
 
-# +++ ADD in validation_step after base val loss computed +++
-if self.enable_hydra_aux:
-    hydra_out = out.get("hydra_heads", None)
-    traj = out.get("trajectory", None)
-    if (hydra_out is not None) and (traj is not None) and (self.rule_teachers is not None) and (self.hydra_losses is not None):
-        teacher = self.rule_teachers(traj, context=None)
-        aux_losses = self.hydra_losses(hydra_out, teacher)
-        val_loss = val_loss + aux_losses["loss_hydra_total"]
-
-        self.log("val/hydra_total", aux_losses["loss_hydra_total"], on_step=False, on_epoch=True, prog_bar=False)
-        for k, v in aux_losses.items():
-            if k == "loss_hydra_total":
-                continue
-            self.log(f"val/{k}", v, on_step=False, on_epoch=True, prog_bar=False)
+# +++ ADD to returned objectives dict +++
+"hydra_total": float(hydra_total.detach().item()),
+"hydra_loss_feasibility": float(hydra_losses_dict.get("loss_feasibility", hydra_total.new_zeros(())).detach().item()),
+"hydra_loss_cost": float(hydra_losses_dict.get("loss_cost", hydra_total.new_zeros(())).detach().item()),
+"hydra_loss_progress": float(hydra_losses_dict.get("loss_progress", hydra_total.new_zeros(())).detach().item()),
+"hydra_loss_comfort": float(hydra_losses_dict.get("loss_comfort", hydra_total.new_zeros(())).detach().item()),
+"teacher_feasible_rate": float(
+    (teacher["feasibility"] >= 0.5).float().mean().detach().item()
+) if (self.use_hydra_aux and (self.rule_teachers is not None) and ("teacher" in locals())) else 0.0,
 # --- END ---
+
+
+
+
+
