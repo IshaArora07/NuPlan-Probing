@@ -1,44 +1,51 @@
 # src/splitters/token_list_splitter.py
 
-from typing import List, Set
-from nuplan.planning.training.data_splitter.data_splitter import DataSplitter
+from typing import List, Set, Tuple
+
 from nuplan.planning.scenario_builder.abstract_scenario import AbstractScenario
+from nuplan.planning.training.data_loader.splitter import AbstractSplitter
+from nuplan.planning.utils.multithreading.worker_pool import WorkerPool
 
 
-class TokenListSplitter(DataSplitter):
+class TokenListSplitter(AbstractSplitter):
     """
     Deterministic splitter based on explicit scenario tokens.
 
-    - Scenarios whose token is in `val_tokens` → validation
-    - Scenarios whose token is in `train_tokens` → training
-    - Everything else is ignored (not used by either split)
+    Rules:
+      - token in val_tokens   -> val
+      - token in train_tokens -> train
+      - everything else       -> ignored (not used)
+      - test is always empty
     """
 
-    def __init__(
-        self,
-        train_tokens: List[str],
-        val_tokens: List[str],
-    ):
+    def __init__(self, train_tokens: List[str], val_tokens: List[str]):
         self._train_tokens: Set[str] = set(train_tokens)
         self._val_tokens: Set[str] = set(val_tokens)
 
-        # Safety check
-        overlap = self._train_tokens.intersection(self._val_tokens)
-        if overlap:
-            raise ValueError(f"Train/val token overlap detected: {len(overlap)} tokens")
+        overlap = self._train_tokens & self._val_tokens
+        assert len(overlap) == 0, f"Train/val token overlap detected: {len(overlap)} tokens"
 
-    def get_train_scenarios(
-        self, scenarios: List[AbstractScenario]
-    ) -> List[AbstractScenario]:
-        return [
-            s for s in scenarios
-            if s.token in self._train_tokens
-        ]
+    def _split(self, scenarios: List[AbstractScenario]) -> Tuple[List[AbstractScenario], List[AbstractScenario]]:
+        train: List[AbstractScenario] = []
+        val: List[AbstractScenario] = []
 
-    def get_validation_scenarios(
-        self, scenarios: List[AbstractScenario]
-    ) -> List[AbstractScenario]:
-        return [
-            s for s in scenarios
-            if s.token in self._val_tokens
-        ]
+        for s in scenarios:
+            # NuPlan scenarios expose .token
+            tok = s.token
+            if tok in self._val_tokens:
+                val.append(s)
+            elif tok in self._train_tokens:
+                train.append(s)
+
+        return train, val
+
+    def get_train_samples(self, scenarios: List[AbstractScenario], worker: WorkerPool) -> List[AbstractScenario]:
+        train, _ = self._split(scenarios)
+        return train
+
+    def get_val_samples(self, scenarios: List[AbstractScenario], worker: WorkerPool) -> List[AbstractScenario]:
+        _, val = self._split(scenarios)
+        return val
+
+    def get_test_samples(self, scenarios: List[AbstractScenario], worker: WorkerPool) -> List[AbstractScenario]:
+        return []
