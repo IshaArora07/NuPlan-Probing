@@ -27,14 +27,7 @@ logger = logging.getLogger(__name__)
 
 class LightningTrainer(pl.LightningModule):
     """
-    HARD-EMoE Lightning Trainer.
-
-    Loss:
-        L = w_reg * L_reg
-          + w_cls * L_cls
-          + w_col * L_col
-          + w_pred * L_pred
-          + w_router * L_router
+    HARD-EMoE Lightning Trainer with Router Diagnostics.
     """
 
     def __init__(
@@ -46,7 +39,6 @@ class LightningTrainer(pl.LightningModule):
         warmup_epochs: int,
         use_collision_loss: bool = True,
         regulate_yaw: bool = False,
-        objective_aggregate_mode: str = "mean",
 
         # EMoE loss weights
         k_R: float = 0.2,
@@ -56,7 +48,7 @@ class LightningTrainer(pl.LightningModule):
         w_col: float = 1.0,
         w_pred: float = 1.0,
         w_router: float = 1.0,
-    ) -> None:
+    ):
         super().__init__()
         self.save_hyperparameters(ignore=["model"])
 
@@ -69,6 +61,7 @@ class LightningTrainer(pl.LightningModule):
         self.history_steps = model.history_steps
         self.radius = model.radius
         self.num_modes = model.num_modes
+        self.num_scene_types = model.num_scene_types
 
         self.use_collision_loss = use_collision_loss
         self.regulate_yaw = regulate_yaw
@@ -85,11 +78,14 @@ class LightningTrainer(pl.LightningModule):
         if use_collision_loss:
             self.collision_loss = ESDFCollisionLoss()
 
-    # ------------------------------------------------------------------
-    # Metrics
-    # ------------------------------------------------------------------
+        # ---------------- Router diagnostics buffers ----------------
+        self._router_stats = None
 
-    def on_fit_start(self) -> None:
+    # ==============================================================
+    # Metrics
+    # ==============================================================
+
+    def on_fit_start(self):
         metrics_collection = MetricCollection(
             [
                 minADE().to(self.device),
@@ -104,9 +100,64 @@ class LightningTrainer(pl.LightningModule):
             "val": metrics_collection.clone(prefix="val/"),
         }
 
-    # ------------------------------------------------------------------
+    # ==============================================================
+    # Router diagnostics helpers
+    # ==============================================================
+
+    def _reset_router_stats(self):
+        S = self.num_scene_types
+        self._router_stats = {
+            "count": 0,
+            "correct": 0,
+            "entropy_sum": 0.0,
+            "label_counts": torch.zeros(S, device=self.device),
+            "expert_counts": torch.zeros(S, device=self.device),
+            "confusion": torch.zeros(S, S, device=self.device),
+        }
+
+    def on_train_epoch_start(self):
+        self._reset_router_stats()
+
+    def on_validation_epoch_start(self):
+        self._reset_router_stats()
+
+    def _log_router_stats(self, prefix: str):
+        stats = self._router_stats
+        if stats is None or stats["count"] == 0:
+            return
+
+        count = stats["count"]
+
+        entropy_mean = stats["entropy_sum"] / count
+        accuracy = stats["correct"] / count
+
+        self.log(f"router/{prefix}_entropy", entropy_mean, prog_bar=True)
+        self.log(f"router/{prefix}_accuracy", accuracy, prog_bar=True)
+
+        usage = stats["expert_counts"] / stats["expert_counts"].sum().clamp(min=1)
+        for i in range(self.num_scene_types):
+            self.log(f"router/{prefix}_usage_expert_{i}", usage[i])
+            self.log(f"router/{prefix}_label_count_{i}", stats["label_counts"][i])
+
+        for i in range(self.num_scene_types):
+            for j in range(self.num_scene_types):
+                self.log(
+                    f"router/{prefix}_confusion_{i}_to_{j}",
+                    stats["confusion"][i, j],
+                )
+
+    def on_train_epoch_end(self):
+        self._log_router_stats("train")
+
+    def on_validation_epoch_end(self):
+        self._log_router_stats("val")
+
+    # ==============================================================
     # Lightning steps
-    # ------------------------------------------------------------------
+    # ==============================================================
+
+    def forward(self, features: FeaturesType):
+        return self.model(features)
 
     def training_step(self, batch, batch_idx):
         return self._step(batch, "train")
@@ -117,13 +168,6 @@ class LightningTrainer(pl.LightningModule):
     def test_step(self, batch, batch_idx):
         return self._step(batch, "test")
 
-    def forward(self, features: FeaturesType):
-        return self.model(features)
-
-    # ------------------------------------------------------------------
-    # Core step
-    # ------------------------------------------------------------------
-
     def _step(
         self,
         batch: Tuple[FeaturesType, TargetsType, ScenarioListType],
@@ -133,32 +177,25 @@ class LightningTrainer(pl.LightningModule):
         data = features["feature"].data
 
         res = self.forward(data)
-
         losses = self._compute_objectives(res, data)
         metrics = self._compute_metrics(res, data, prefix)
 
         self._log_step(losses["loss"], losses, metrics, prefix)
         return losses["loss"] if self.training else 0.0
 
-    # ------------------------------------------------------------------
+    # ==============================================================
     # Objectives
-    # ------------------------------------------------------------------
+    # ==============================================================
 
     def _compute_objectives(self, res, data) -> Dict[str, torch.Tensor]:
-        """
-        HARD-EMoE objective computation.
-        """
-
-        trajectory = res["trajectory"]          # [B, 1, Ka, T, 6]
-        probability = res["probability"]        # [B, 1, Ka]
-        prediction = res["prediction"]          # [B, A-1, T, 2]
+        trajectory = res["trajectory"]      # [B,1,Ka,T,6]
+        probability = res["probability"]    # [B,1,Ka]
+        prediction = res["prediction"]      # [B,A-1,T,2]
 
         bs = trajectory.shape[0]
         T = prediction.shape[2]
 
-        # -------------------------
-        # Ground truth
-        # -------------------------
+        # ---------------- Ground truth ----------------
         targets_pos = data["agent"]["target"][:bs]
         valid_mask = data["agent"]["valid_mask"][:bs, :, -T:]
         targets_vel = data["agent"]["velocity"][:bs, :, -T:]
@@ -179,36 +216,40 @@ class LightningTrainer(pl.LightningModule):
         pred_valid_mask = valid_mask[:, 1:]
         pred_target_xy = target_xy[:, 1:]
 
-        # -------------------------
-        # Planning losses
-        # -------------------------
+        # ---------------- Planning losses ----------------
         ego_reg_loss, ego_cls_loss, collision_loss = self.get_planning_loss(
-            data,
-            trajectory,
-            probability,
-            ego_valid_mask,
-            ego_target_6d,
-            bs,
+            data, trajectory, probability, ego_valid_mask, ego_target_6d, bs
         )
 
-        # -------------------------
-        # Prediction loss
-        # -------------------------
+        # ---------------- Prediction loss ----------------
         prediction_loss = self.get_prediction_loss(
             prediction, pred_valid_mask, pred_target_xy
         )
 
-        # -------------------------
-        # Router loss (HARD)
-        # -------------------------
-        router_logits = res["router_logits"]
+        # ---------------- Router loss ----------------
+        router_logits = res["router_logits"]           # [B,S]
+        router_idx = res["router_idx"]                 # [B]
         scene_labels = data["emoe"]["scene_label"][:bs].long()
 
         router_loss = F.cross_entropy(router_logits, scene_labels)
 
-        # -------------------------
-        # Total loss
-        # -------------------------
+        # ---------------- Router diagnostics ----------------
+        with torch.no_grad():
+            probs = F.softmax(router_logits, dim=-1)
+            entropy = -(probs * torch.log(probs + 1e-9)).sum(dim=-1)
+
+            self._router_stats["count"] += bs
+            self._router_stats["entropy_sum"] += entropy.sum().item()
+            self._router_stats["correct"] += (router_idx == scene_labels).sum().item()
+
+            for i in range(bs):
+                lbl = scene_labels[i]
+                exp = router_idx[i]
+                self._router_stats["label_counts"][lbl] += 1
+                self._router_stats["expert_counts"][exp] += 1
+                self._router_stats["confusion"][lbl, exp] += 1
+
+        # ---------------- Total loss ----------------
         loss = (
             self.w_reg * ego_reg_loss
             + self.w_cls * ego_cls_loss
@@ -226,21 +267,16 @@ class LightningTrainer(pl.LightningModule):
             "router_loss": router_loss.detach(),
         }
 
-    # ------------------------------------------------------------------
-    # Prediction loss
-    # ------------------------------------------------------------------
+    # ==============================================================
+    # Loss helpers
+    # ==============================================================
 
     def get_prediction_loss(self, prediction, valid_mask, target_xy):
         diff = F.smooth_l1_loss(
             prediction, target_xy, reduction="none"
         ).sum(-1)
-
         diff = diff * valid_mask
         return diff.sum() / (valid_mask.sum() + 1e-6)
-
-    # ------------------------------------------------------------------
-    # Planning losses (unchanged PLUTO logic)
-    # ------------------------------------------------------------------
 
     def get_planning_loss(self, data, trajectory, probability, valid_mask, target, bs):
         num_valid_points = valid_mask.sum(-1)
@@ -265,9 +301,6 @@ class LightningTrainer(pl.LightningModule):
             torch.arange(bs), target_r_index, target_m_index
         ]
 
-        # -------------------------
-        # Collision loss
-        # -------------------------
         if self.use_collision_loss:
             collision_loss = self.collision_loss(
                 best_trajectory, data["cost_maps"][:bs, :, :, 0].float()
@@ -275,9 +308,6 @@ class LightningTrainer(pl.LightningModule):
         else:
             collision_loss = trajectory.new_zeros(1)
 
-        # -------------------------
-        # Regression loss
-        # -------------------------
         reg_per_step = F.smooth_l1_loss(
             best_trajectory, target, reduction="none"
         ).sum(-1)
@@ -290,9 +320,6 @@ class LightningTrainer(pl.LightningModule):
             weighted_mask.sum() + 1e-6
         )
 
-        # -------------------------
-        # Classification loss
-        # -------------------------
         probability = probability.reshape(bs, -1)
         target_label = torch.zeros_like(probability)
         target_label[torch.arange(bs), target_m_index] = 1.0
@@ -301,9 +328,9 @@ class LightningTrainer(pl.LightningModule):
 
         return reg_loss, cls_loss, collision_loss
 
-    # ------------------------------------------------------------------
-    # Metrics
-    # ------------------------------------------------------------------
+    # ==============================================================
+    # Metrics + logging
+    # ==============================================================
 
     def _compute_metrics(self, res, data, prefix):
         trajectory = res["trajectory"]
@@ -330,10 +357,6 @@ class LightningTrainer(pl.LightningModule):
 
         return self.metrics[prefix](outputs, target)
 
-    # ------------------------------------------------------------------
-    # Logging
-    # ------------------------------------------------------------------
-
     def _log_step(self, loss, objectives, metrics, prefix):
         self.log(
             f"loss/{prefix}",
@@ -359,9 +382,9 @@ class LightningTrainer(pl.LightningModule):
             sync_dist=True,
         )
 
-    # ------------------------------------------------------------------
+    # ==============================================================
     # Optimizer
-    # ------------------------------------------------------------------
+    # ==============================================================
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(
