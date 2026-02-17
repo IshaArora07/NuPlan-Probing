@@ -16,15 +16,34 @@ COPY emoe/ /workspace/emoe/
 # Install Python deps:
 # 1) nuplan-devkit requirements
 # 2) emoe requirements
+RUN pip install --no-cache-dir \
+    torch==2.0.1 \
+    torchvision==0.15.2 \
+    --index-url https://download.pytorch.org/whl/cu118
+
+# ------------------------------------------------------------
+# NATTEN — install from LOCAL wheel (no expired certs)
+# You must have: wheels/natten-0.14.6*.whl in build context
+# ------------------------------------------------------------
+COPY wheels/ /wheels/
+RUN pip install --no-cache-dir /wheels/natten-0.14.6*.whl
+
+# ------------------------------------------------------------
+# nuPlan devkit
+# (editable install + its requirements)
+# ------------------------------------------------------------
 RUN pip install --no-cache-dir -r /workspace/nuplan-devkit/requirements.txt && \
-    pip install --no-cache-dir -r /workspace/emoe/requirements.txt
+    pip install --no-cache-dir -e /workspace/nuplan-devkit
 
-# Make both importable.
-# nuplan-devkit is typically installed editable.
-RUN pip install --no-cache-dir -e /workspace/nuplan-devkit
+# ------------------------------------------------------------
+# EMOE / PLUTO requirements
+# (this replaces: pip install -r ./requirements.txt in setup_env.sh)
+# ------------------------------------------------------------
+RUN pip install --no-cache-dir -r /workspace/emoe/requirements.txt
 
-# If your emoe folder is a proper package (has setup.py or pyproject.toml), install editable.
-# If it is not, we'll use PYTHONPATH in entrypoint.
+# ------------------------------------------------------------
+# Make EMOE importable
+# ------------------------------------------------------------
 RUN if [ -f /workspace/emoe/setup.py ] || [ -f /workspace/emoe/pyproject.toml ]; then \
       pip install --no-cache-dir -e /workspace/emoe ; \
     fi
