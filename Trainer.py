@@ -235,19 +235,33 @@ class LightningTrainer(pl.LightningModule):
 
         # ---------------- Router diagnostics ----------------
         with torch.no_grad():
-            probs = F.softmax(router_logits, dim=-1)
-            entropy = -(probs * torch.log(probs + 1e-9)).sum(dim=-1)
+    logits = router_logits[:train_num]                # [N,S]
+    labels = scene_labels[:train_num]                 # [N]
+    probs = F.softmax(logits, dim=-1)                 # [N,S]
+    pred = probs.argmax(dim=-1)                       # [N]
 
-            self._router_stats["count"] += bs
-            self._router_stats["entropy_sum"] += entropy.sum().item()
-            self._router_stats["correct"] += (router_idx == scene_labels).sum().item()
+    # entropy per sample
+    ent = -(probs * (probs.clamp_min(1e-12)).log()).sum(dim=-1)  # [N]
 
-            for i in range(bs):
-                lbl = scene_labels[i]
-                exp = router_idx[i]
-                self._router_stats["label_counts"][lbl] += 1
-                self._router_stats["expert_counts"][exp] += 1
-                self._router_stats["confusion"][lbl, exp] += 1
+    S = logits.shape[-1]
+
+    # lazy init accumulators
+    if not hasattr(self, "_router_cm") or self._router_cm is None:
+        self._router_cm = torch.zeros(S, S, device=logits.device, dtype=torch.long)
+        self._router_entropy_sum = 0.0
+        self._router_count = 0
+        self._router_usage = torch.zeros(S, device=logits.device, dtype=torch.long)
+
+    # confusion update
+    for t, p in zip(labels.view(-1), pred.view(-1)):
+        self._router_cm[int(t.item()), int(p.item())] += 1
+
+    # usage update
+    for p in pred.view(-1):
+        self._router_usage[int(p.item())] += 1
+
+    self._router_entropy_sum += float(ent.sum().item())
+    self._router_count += int(labels.numel())
 
         # ---------------- Total loss ----------------
         loss = (
