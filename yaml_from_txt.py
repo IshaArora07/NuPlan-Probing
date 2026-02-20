@@ -1,25 +1,12 @@
-import yaml
-
-def txt_to_yaml(
-    txt_path: str,
-    yaml_path: str,
-    key: str = "scenario_tokens",
-):
-    # Read tokens from txt
+def txt_to_yaml(txt_path: str, yaml_path: str):
     with open(txt_path, "r") as f:
         tokens = [line.strip() for line in f if line.strip()]
 
-    # Create YAML structure
-    data = {key: tokens}
-
-    # Write YAML
     with open(yaml_path, "w") as f:
-        yaml.safe_dump(
-            data,
-            f,
-            default_flow_style=False,
-            sort_keys=False,
-        )
+        f.write("scenario_tokens:\n")
+        for token in tokens:
+            f.write(f'  - "{token}"\n')
+
 
 if __name__ == "__main__":
     txt_to_yaml(
