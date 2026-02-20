@@ -86,6 +86,9 @@ class LightningTrainer(pl.LightningModule):
     # ==============================================================
 
     def on_fit_start(self):
+        S = self.model.num_scene_types
+        self._router_stats_train = None
+        self._router_stats_val = None
         metrics_collection = MetricCollection(
             [
                 minADE().to(self.device),
@@ -116,10 +119,26 @@ class LightningTrainer(pl.LightningModule):
         }
 
     def on_train_epoch_start(self):
-        self._reset_router_stats()
+        S = self.num_scene_types
+        self._router_stats_train = {
+            "count": 0,
+            "correct": 0,
+            "entropy_sum": 0.0,
+            "label_counts": torch.zeros(S, device=self.device),
+            "expert_counts": torch.zeros(S, device=self.device),
+            "confusion": torch.zeros(S, S, device=self.device),
+        }
 
     def on_validation_epoch_start(self):
-        self._reset_router_stats()
+        S = self.num_scene_types
+        self._router_stats_val = {
+            "count": 0,
+            "correct": 0,
+            "entropy_sum": 0.0,
+            "label_counts": torch.zeros(S, device=self.device),
+            "expert_counts": torch.zeros(S, device=self.device),
+            "confusion": torch.zeros(S, S, device=self.device),
+        }
 
     def _log_router_stats(self, prefix: str):
         stats = self._router_stats
@@ -134,16 +153,17 @@ class LightningTrainer(pl.LightningModule):
         self.log(f"router/{prefix}_entropy", entropy_mean, prog_bar=True)
         self.log(f"router/{prefix}_accuracy", accuracy, prog_bar=True)
 
-        usage = stats["expert_counts"] / stats["expert_counts"].sum().clamp(min=1)
+        usage = stats["expert_counts"] / (stats["expert_counts"].sum() + 1e-6)
         for i in range(self.num_scene_types):
-            self.log(f"router/{prefix}_usage_expert_{i}", usage[i])
-            self.log(f"router/{prefix}_label_count_{i}", stats["label_counts"][i])
+            self.log(f"router/{prefix}_usage_expert_{i}", usage[i], sync_dist=True)
+            self.log(f"router/{prefix}_label_count_{i}", stats["label_counts"][i], sync_dist=True)
 
         for i in range(self.num_scene_types):
             for j in range(self.num_scene_types):
                 self.log(
                     f"router/{prefix}_confusion_{i}_to_{j}",
                     stats["confusion"][i, j],
+                    sync_dist=True
                 )
 
     def on_train_epoch_end(self):
@@ -188,13 +208,18 @@ class LightningTrainer(pl.LightningModule):
     # ==============================================================
 
     def _compute_objectives(self, res, data) -> Dict[str, torch.Tensor]:
-        trajectory = res["trajectory"]      # [B,1,Ka,T,6]
-        probability = res["probability"]    # [B,1,Ka]
-        prediction = res["prediction"]      # [B,A-1,T,2]
+        bs, _, T, _ = res["prediction"].shape
 
-        bs = trajectory.shape[0]
-        T = prediction.shape[2]
+        if self.use_contrast_loss:
+            train_num = (bs // 3) * 2 if self.training else bs
+        else:
+            train_num = bs
 
+        trajectory = res["trajectory"][:train_num]
+        probability = res["probability"][:train_num]
+        prediction = res["prediction"][:train_num]
+        ref_free_trajectory = res.get("ref_free_trajectory", None)
+        
         # ---------------- Ground truth ----------------
         targets_pos = data["agent"]["target"][:bs]
         valid_mask = data["agent"]["valid_mask"][:bs, :, -T:]
@@ -228,40 +253,57 @@ class LightningTrainer(pl.LightningModule):
 
         # ---------------- Router loss ----------------
         router_logits = res["router_logits"]           # [B,S]
-        router_idx = res["router_idx"]                 # [B]
-        scene_labels = data["emoe"]["scene_label"][:bs].long()
+        router_idx = res.get("router_idx", None)             # [B]
+        scene_labels = data["emoe"]["emoe_class_id"][:bs].long()
+
+        if router_idx is None:
+            router_idx = torch.argmax(router_logits, dim=-1)
+        else:
+            router_idx = router_idx[:bs].long()
 
         router_loss = F.cross_entropy(router_logits, scene_labels)
 
+        if self.global_step < 5:  # only first few steps
+            with torch.no_grad():
+                per_sample_nll = -F.log_softmax(router_logits, dim=-1).gather(
+                    1, scene_labels.view(-1, 1)
+                ).squeeze(1)
+                logger.warning(
+                    f"[Router debug] step={self.global_step} "
+                    f"labels={scene_labels.detach().cpu().tolist()} "
+                    f"preds={router_idx.detach().cpu().tolist()} "
+                    f"CE={router_loss.item():.6f} "
+                    f"mean_nll={per_sample_nll.mean().item():.6f} "
+                    f"nlls={per_sample_nll.detach().cpu().tolist()}"
+                )
+
         # ---------------- Router diagnostics ----------------
         with torch.no_grad():
-    logits = router_logits[:train_num]                # [N,S]
-    labels = scene_labels[:train_num]                 # [N]
-    probs = F.softmax(logits, dim=-1)                 # [N,S]
-    pred = probs.argmax(dim=-1)                       # [N]
+            probs = F.softmax(router_logits, dim=-1)
+            entropy = -(probs * torch.log(probs + 1e-9)).sum(dim=-1)
 
-    # entropy per sample
-    ent = -(probs * (probs.clamp_min(1e-12)).log()).sum(dim=-1)  # [N]
+            self._router_stats["count"] += bs
+            self._router_stats["entropy_sum"] += entropy.sum().item()
+            self._router_stats["correct"] += (router_idx == scene_labels).sum().item()
 
-    S = logits.shape[-1]
+            S = self.num_scene_types
 
-    # lazy init accumulators
-    if not hasattr(self, "_router_cm") or self._router_cm is None:
-        self._router_cm = torch.zeros(S, S, device=logits.device, dtype=torch.long)
-        self._router_entropy_sum = 0.0
-        self._router_count = 0
-        self._router_usage = torch.zeros(S, device=logits.device, dtype=torch.long)
+            self._router_stats["label_counts"] += torch.bincount(
+                scene_labels, minlength=S
+            ).to(self._router_stats["label_counts].dtype
 
-    # confusion update
-    for t, p in zip(labels.view(-1), pred.view(-1)):
-        self._router_cm[int(t.item()), int(p.item())] += 1
+            self._router_stats["expert_counts"] += torch.bincount(
+                router_idx, minlength=S
+            ).to(self._router_stats["expert_counts"].dtype
 
-    # usage update
-    for p in pred.view(-1):
-        self._router_usage[int(p.item())] += 1
-
-    self._router_entropy_sum += float(ent.sum().item())
-    self._router_count += int(labels.numel())
+            cm_update = torch.zeros((S,S), device=router_logits.device)
+            cm_update.index_put_(
+                (scene_labels, router_idx),
+                torch.ones_like(scene_labels, dtype=cm_update.dtype),
+                accumulate=True
+            )
+            self._router_stats["confusion"] += cm_update
+            
 
         # ---------------- Total loss ----------------
         loss = (
@@ -293,54 +335,85 @@ class LightningTrainer(pl.LightningModule):
         return diff.sum() / (valid_mask.sum() + 1e-6)
 
     def get_planning_loss(self, data, trajectory, probability, valid_mask, target, bs):
-        num_valid_points = valid_mask.sum(-1)
-        endpoint_index = (num_valid_points / 10).long().clamp_(0, 7)
+    
+    # Sanity
+    assert trajectory.dim() == 5, trajectory.shape
+    assert probability.dim() == 3, probability.shape
+    assert trajectory.shape[0] == bs and probability.shape[0] == bs
+    assert trajectory.shape[1] == 1 and probability.shape[1] == 1, (
+        f"EMoE expects R=1 but got traj={trajectory.shape}, prob={probability.shape}"
+    )
 
-        r_padding_mask = ~data["reference_line"]["valid_mask"][:bs].any(-1)
+    Ka = trajectory.shape[2]
+    T = trajectory.shape[3]
 
-        future_projection = data["reference_line"]["future_projection"][:bs][
-            torch.arange(bs), :, endpoint_index
-        ]
+    # Flatten R=1
+    traj_modes = trajectory[:, 0]      # (bs, Ka, T, 6)
+    prob_logits = probability[:, 0]    # (bs, Ka)
 
-        target_r_index = torch.argmin(
-            future_projection[..., 1] + 1e6 * r_padding_mask, dim=-1
+    # Valid mask
+    mask = valid_mask.float()          # (bs, T)
+    mask = mask[:, None, :]            # (bs, 1, T) for broadcasting
+
+    # -------------------------------------------------------
+    # Winner-Take-All assignment: choose closest mode to GT
+    # -------------------------------------------------------
+    # Per-mode distance to GT (robust): SmoothL1 over 6 dims, sum over dims & time with mask
+    per_step = F.smooth_l1_loss(
+        traj_modes, target[:, None, :, :], reduction="none"
+    ).sum(-1)                           # (bs, Ka, T)
+
+    per_mode = (per_step * mask).sum(-1) / (mask.sum(-1) + 1e-6)  # (bs, Ka)
+    target_m_index = torch.argmin(per_mode, dim=-1)               # (bs,)
+
+    # Gather best trajectory
+    best_trajectory = traj_modes[torch.arange(bs, device=traj_modes.device), target_m_index]  # (bs, T, 6)
+
+    # -------------------------------------------------------
+    # Collision loss on best trajectory (optional)
+    # -------------------------------------------------------
+    if self.use_collision_loss:
+        collision_loss = self.collision_loss(
+            best_trajectory, data["cost_maps"][:bs, :, :, 0].float()
         )
+    else:
+        collision_loss = traj_modes.new_zeros(1)
 
-        target_m_index = (
-            future_projection[torch.arange(bs), target_r_index, 0]
-            / (self.radius / self.num_modes)
-        ).long().clamp_(0, self.num_modes - 1)
+    # -------------------------------------------------------
+    # Regression loss (your temporal weighting stays valid)
+    # -------------------------------------------------------
+    reg_per_step = F.smooth_l1_loss(best_trajectory, target, reduction="none").sum(-1)  # (bs, T)
 
-        best_trajectory = trajectory[
-            torch.arange(bs), target_r_index, target_m_index
-        ]
+    time_idx = torch.arange(T, device=reg_per_step.device, dtype=reg_per_step.dtype)
+    base_w = torch.exp(-self.k_R * time_idx)                 # (T,)
+    weights = base_w.unsqueeze(0).expand(bs, -1).clone()     # (bs, T)
 
-        if self.use_collision_loss:
-            collision_loss = self.collision_loss(
-                best_trajectory, data["cost_maps"][:bs, :, :, 0].float()
-            )
-        else:
-            collision_loss = trajectory.new_zeros(1)
+    # (keep your interaction-based reweighting if you want)
+    # NOTE: uses GT agent targets, same as your current code
+    gt_all_xy = data["agent"]["target"][:bs, :, -T:, :2]     # (bs, A, T, 2)
+    ego_xy = gt_all_xy[:, 0]                                 # (bs, T, 2)
+    other_xy = gt_all_xy[:, 1:]                              # (bs, A-1, T, 2)
 
-        reg_per_step = F.smooth_l1_loss(
-            best_trajectory, target, reduction="none"
-        ).sum(-1)
+    if other_xy.numel() > 0:
+        dist = torch.norm(other_xy - ego_xy.unsqueeze(1), dim=-1)  # (bs, A-1, T)
+        inter_any = (dist < self.interaction_distance_threshold).any(dim=1)  # (bs, T)
+        for b in range(bs):
+            idx = torch.nonzero(inter_any[b], as_tuple=False).flatten()
+            if idx.numel() == 0:
+                continue
+            t_in = int(idx[0].item())
+            t_out = int(idx[-1].item())
+            weights[b, t_in : t_out + 1] = 1.0
 
-        time_idx = torch.arange(reg_per_step.shape[1], device=reg_per_step.device)
-        weights = torch.exp(-self.k_R * time_idx).unsqueeze(0)
+    weighted_mask = weights * valid_mask.float()
+    reg_loss = (reg_per_step * weighted_mask).sum() / (weighted_mask.sum() + 1e-6)
 
-        weighted_mask = weights * valid_mask
-        reg_loss = (reg_per_step * weighted_mask).sum() / (
-            weighted_mask.sum() + 1e-6
-        )
+    # -------------------------------------------------------
+    # Classification loss: CE over Ka modes
+    # -------------------------------------------------------
+    cls_loss = F.cross_entropy(prob_logits, target_m_index.detach())
 
-        probability = probability.reshape(bs, -1)
-        target_label = torch.zeros_like(probability)
-        target_label[torch.arange(bs), target_m_index] = 1.0
-
-        cls_loss = F.cross_entropy(probability, target_label.detach())
-
-        return reg_loss, cls_loss, collision_loss
+    return reg_loss, cls_loss, collision_loss
 
     # ==============================================================
     # Metrics + logging
@@ -351,7 +424,7 @@ class LightningTrainer(pl.LightningModule):
         probability = res["probability"]
 
         r_padding_mask = ~data["reference_line"]["valid_mask"].any(-1)
-        probability.masked_fill_(r_padding_mask.unsqueeze(-1), -1e6)
+        #probability.masked_fill_(r_padding_mask.unsqueeze(-1), -1e6)
 
         bs, R, M, T, _ = trajectory.shape
         trajectory = trajectory.reshape(bs, R * M, T, -1)
@@ -373,7 +446,7 @@ class LightningTrainer(pl.LightningModule):
 
     def _log_step(self, loss, objectives, metrics, prefix):
         self.log(
-            f"loss/{prefix}",
+            f"loss/{prefix}_{loss_name}",
             loss,
             on_step=True,
             on_epoch=True,
