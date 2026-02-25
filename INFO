@@ -287,3 +287,10 @@ Motion gates:
 	•	MIN_DIST_ANY (5m)
 	•	MIN_DIST_TURN_AT_INTERSECTION (12m)
 	•	↑ reduces jitter-turns but may push short turns into others
+
+
+IMPROVEMENTS :-
+Early in training the router is essentially random across 6 classes, so the wrong anchor set and wrong expert get used for most samples. 
+The planning decoder and query generator then try to learn from a chaotic routing signal, which can prevent the experts from ever properly specializing.
+The standard solution is teacher forcing with scheduled switching — use ground truth labels during early training and gradually transition to predicted labels. 
+Do you want to go with a simple epoch-based switch (ground truth for first N epochs, then predicted)
