@@ -42,3 +42,42 @@ def patch_emoe_outputs():
         return output
 
     AbstractPlanner.compute_trajectory = wrapped_compute
+
+
+
+import torch
+
+for runner in runners:
+    planner = runner.planner
+    original_compute = planner.compute_trajectory
+
+    def patched_compute(current_input, orig=original_compute):
+        out = orig(current_input)
+
+        # If model returned tuple (your case sometimes)
+        if isinstance(out, tuple):
+            out = out[0]
+
+        if isinstance(out, dict) and "candidate_trajectories" not in out:
+
+            traj = out["trajectory"]   # [B,1,Ka,T,6]
+
+            if isinstance(traj, torch.Tensor) and traj.ndim == 5:
+                traj = traj[0, 0]      # [Ka,T,6]
+
+                candidates = traj[..., :3]  # [Ka,T,3]
+
+                if "probability" in out:
+                    probs = out["probability"][0, 0]
+                    best_idx = torch.argmax(probs).item()
+                else:
+                    best_idx = 0
+
+                best_traj = candidates[best_idx]
+
+                out["candidate_trajectories"] = candidates
+                out["trajectory"] = best_traj
+
+        return out
+
+    planner.compute_trajectory = patched_compute
