@@ -2,11 +2,12 @@
 """
 EMoE Trajectory Spaghetti Plotter
 
-Loads trajectories directly from PLUTO cache files (features.gz / trajectory.gz),
-both of which store a dict {'data': <PlutoFeature>}.
+Loads GT trajectories from PLUTO cache:
+trajectory.gz  →  {'data': ndarray shape (8, 3)}
+8 waypoints at 1s intervals (0→8s future)
+columns: (x, y, heading)  in ego-init frame already
 
 Cache structure:
-<cache_dir>/<log_name>/<scenario_tag>/<token>/features.gz
 <cache_dir>/<log_name>/<scenario_tag>/<token>/trajectory.gz
 """
 
@@ -48,18 +49,14 @@ SHORT_NAMES = [
 "U-turn",
 ]
 
-CLASS_COLORS = ["#E63946","#2196F3","#FF9800","#4CAF50","#9C27B0","#00BCD4"]
-
-DEFAULT_HISTORY_SAMPLES = 20
-DEFAULT_FUTURE_SAMPLES  = 80
-
+CLASS_COLORS = ["#E63946", "#2196F3", "#FF9800", "#4CAF50", "#9C27B0", "#00BCD4"]
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Cache indexing
 # ──────────────────────────────────────────────────────────────────────────────
 
 def build_token_index(cache_dir: Path) -> dict:
-    """token -> {"features": Path|None, "trajectory": Path|None, "log", "tag"}"""
+    """token -> {"trajectory": Path|None, "features": Path|None, "log", "tag"}"""
 
     index = {}
 
@@ -75,155 +72,57 @@ def build_token_index(cache_dir: Path) -> dict:
                 if not tok_dir.is_dir():
                     continue
 
-                feat_p = tok_dir / "features.gz"
                 traj_p = tok_dir / "trajectory.gz"
+                feat_p = tok_dir / "features.gz"
 
-                if feat_p.exists() or traj_p.exists():
+                if traj_p.exists() or feat_p.exists():
 
                     index[tok_dir.name] = {
-                        "features": feat_p if feat_p.exists() else None,
                         "trajectory": traj_p if traj_p.exists() else None,
+                        "features": feat_p if feat_p.exists() else None,
                         "log": log_dir.name,
                         "tag": tag_dir.name,
                     }
 
     return index
 
-
 # ──────────────────────────────────────────────────────────────────────────────
-# Load gz
-# ──────────────────────────────────────────────────────────────────────────────
-
-def load_gz_data(path: Path) -> dict:
-
-    with gzip.open(path, "rb") as f:
-        obj = pickle.load(f)
-
-    if isinstance(obj, dict) and list(obj.keys()) == ["data"]:
-        obj = obj["data"]
-
-    if hasattr(obj, "serialize"):
-        return obj.serialize()
-
-    if hasattr(obj, "data") and isinstance(obj.data, dict):
-        return obj.data
-
-    if isinstance(obj, dict):
-        return obj
-
-    raise ValueError(f"Unrecognised cache object type: {type(obj)}")
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Extract ego trajectory
+# Load trajectory.gz
 # ──────────────────────────────────────────────────────────────────────────────
 
-def extract_ego_future(
-    data: dict,
-    history_samples: int = DEFAULT_HISTORY_SAMPLES,
-    future_samples: int = DEFAULT_FUTURE_SAMPLES,
-    full_trajectory: bool = False,
-):
+def load_trajectory(path: Path):
 
     try:
 
-        agent = data.get("agent", {})
+        with gzip.open(path, "rb") as f:
+            obj = pickle.load(f)
 
-        pos = agent.get("position")
-        hdg = agent.get("heading")
-
-        if pos is None or hdg is None:
-            return None
-
-        if hasattr(pos, "numpy"):
-            pos = pos.numpy()
-
-        if hasattr(hdg, "numpy"):
-            hdg = hdg.numpy()
-
-        pos = np.asarray(pos, dtype=np.float64)
-        hdg = np.asarray(hdg, dtype=np.float64)
-
-        if pos.ndim != 3 or pos.shape[-1] != 2:
-            return None
-
-        present_idx = history_samples
-
-        ego_pos = pos[0]
-        ego_hdg = hdg[0]
-
-        if full_trajectory:
-            traj_global = ego_pos
+        if isinstance(obj, dict):
+            arr = obj.get("data", obj)
         else:
-            traj_global = ego_pos[present_idx + 1:]
+            arr = obj
 
-        if len(traj_global) < 2:
-            return None
+        if hasattr(arr, "numpy"):
+            arr = arr.numpy()
 
-        x0, y0 = ego_pos[present_idx, 0], ego_pos[present_idx, 1]
+        arr = np.asarray(arr, dtype=np.float32)
 
-        theta = ego_hdg[present_idx]
+        if arr.ndim == 2 and arr.shape[1] >= 2:
+            return arr[:, :2]
 
-        c, s = math.cos(-theta), math.sin(-theta)
+        if arr.ndim == 3 and arr.shape[0] == 1 and arr.shape[2] >= 2:
+            return arr[0, :, :2]
 
-        rel = traj_global - np.array([x0, y0])
-
-        x_rot = c * rel[:, 0] - s * rel[:, 1]
-        y_rot = s * rel[:, 0] + c * rel[:, 1]
-
-        return np.stack([x_rot, y_rot], axis=1).astype(np.float32)
+        return None
 
     except Exception:
         return None
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Pretty printer
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _print_nested(data, indent=0, max_depth=4, depth=0, label=""):
-
-    pad = " " * indent
-
-    prefix = f"{pad}{label}: " if label else pad
-
-    if depth > max_depth:
-        print(prefix + "...")
-        return
-
-    if isinstance(data, dict):
-
-        print(prefix + f"dict ({len(data)} keys)")
-
-        for k in list(data.keys())[:15]:
-
-            _print_nested(data[k], indent+4, max_depth, depth+1, label=repr(k))
-
-    elif isinstance(data, (list, tuple)):
-
-        print(prefix + f"{type(data).__name__} len={len(data)}")
-
-        if data:
-
-            _print_nested(data[0], indent+4, max_depth, depth+1, label="[0]")
-
-    elif hasattr(data, "shape") and hasattr(data, "dtype"):
-
-        print(prefix + f"array shape={tuple(data.shape)}  dtype={data.dtype}")
-
-    else:
-
-        s = str(data)
-
-        print(prefix + s[:100] + ("..." if len(s)>100 else ""))
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # EXPLORE MODE
 # ──────────────────────────────────────────────────────────────────────────────
 
-def explore_mode(cache_dir: Path, labels_path: Path,
-                 history_samples: int, future_samples: int):
+def explore_mode(cache_dir: Path, labels_path: Path):
 
     hdr("Building token index…")
 
@@ -252,7 +151,7 @@ def explore_mode(cache_dir: Path, labels_path: Path,
 
     ok(f"{found} / {len(records)} label tokens found in cache")
 
-    hdr("Inspecting 3 sample files…")
+    hdr("Inspecting 3 sample trajectory.gz files…")
 
     checked = 0
 
@@ -265,34 +164,44 @@ def explore_mode(cache_dir: Path, labels_path: Path,
 
         entry = index[tok]
 
-        gz_path = entry["features"] or entry["trajectory"]
+        if entry["trajectory"] is None:
+            continue
 
         print(f"\n  token : {tok}")
-        print(f"  file  : {gz_path.name}")
+        print(f"  class : {rec.get('emoe_class_name', '?')}  (id={rec.get('emoe_class_id', '?')})")
         print(f"  log   : {entry['log']}")
         print(f"  tag   : {entry['tag']}")
 
         try:
 
-            data = load_gz_data(gz_path)
+            with gzip.open(entry["trajectory"], "rb") as f:
+                raw = pickle.load(f)
 
-            print("  Data structure:")
+            print(f"  raw type  : {type(raw)}")
 
-            _print_nested(data, indent=4, max_depth=3)
+            if isinstance(raw, dict):
 
-            emoe = data.get("emoe")
+                print(f"  raw keys  : {list(raw.keys())}")
 
-            if emoe is not None:
-                ok(f"  emoe label found in cache: {emoe}")
-            else:
-                warn("  No 'emoe' key in this cache file")
+                inner = raw.get("data", None)
 
-            xy = extract_ego_future(data, history_samples, future_samples)
+                if inner is not None:
+
+                    if hasattr(inner, "shape"):
+                        print(f"  data shape: {inner.shape}  dtype={inner.dtype}")
+                        print(f"  data[:3]  :\n{np.asarray(inner[:3])}")
+                    else:
+                        print(f"  data type : {type(inner)}")
+
+            xy = load_trajectory(entry["trajectory"])
 
             if xy is not None:
-                ok(f"  extract_ego_future → shape {xy.shape}")
+
+                ok(f"  load_trajectory → shape {xy.shape}  endpoint=({xy[-1,0]:.2f}, {xy[-1,1]:.2f}) m")
+
             else:
-                err("  extract_ego_future returned None")
+
+                err("  load_trajectory returned None")
 
         except Exception as e:
 
@@ -306,43 +215,237 @@ def explore_mode(cache_dir: Path, labels_path: Path,
         if checked >= 3:
             break
 
+    hdr("Summary")
+
+    print(f"  Cached tokens : {len(index)}")
+    print(f"  Labels found  : {found} / {len(records)}")
+
+    print("\nIf load_trajectory printed a valid shape → run --mode plot\n")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# MAIN
+# PLOT MODE
+# ──────────────────────────────────────────────────────────────────────────────
+
+def plot_mode(cache_dir: Path, labels_path: Path, anchors_path: Path,
+              out_dir: Path, max_traj: int):
+
+    import matplotlib
+    import matplotlib.pyplot as plt
+
+    matplotlib.rcParams.update({
+        "font.family": "DejaVu Sans",
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+    })
+
+    hdr("Building token index…")
+
+    index = build_token_index(cache_dir)
+
+    ok(f"Indexed {len(index)} tokens")
+
+    hdr("Loading labels…")
+
+    token_to_class = {}
+
+    with labels_path.open() as f:
+
+        for line in f:
+
+            line = line.strip()
+
+            if not line:
+                continue
+
+            try:
+
+                rec = json.loads(line)
+
+                token_to_class[rec["token"]] = int(rec.get("emoe_class_id", 6))
+
+            except:
+                pass
+
+    ok(f"Loaded {len(token_to_class)} label records")
+
+    by_class = defaultdict(list)
+
+    for tok, cid in token_to_class.items():
+
+        if tok in index and index[tok]["trajectory"] is not None and cid < 6:
+
+            by_class[cid].append(tok)
+
+    print()
+
+    for c in range(6):
+
+        print(f"  class {c} ({EMOE_SCENE_TYPES[c]:<30s}): {len(by_class[c])} tokens with trajectory.gz")
+
+    hdr("Loading anchors…")
+
+    anchors = np.load(anchors_path)
+
+    ok(f"Anchors shape: {anchors.shape}")
+
+    hdr(f"Plotting (max {max_traj} per class)…")
+
+    rng = np.random.default_rng(seed=42)
+
+    ncols = 3
+    nrows = math.ceil(6 / ncols)
+
+    fig, axes = plt.subplots(nrows, ncols,
+                             figsize=(7 * ncols, 7 * nrows),
+                             constrained_layout=True)
+
+    axes = np.array(axes).flatten()
+
+    parse_errors = 0
+
+    for c in range(6):
+
+        ax   = axes[c]
+        col  = CLASS_COLORS[c]
+        name = SHORT_NAMES[c]
+
+        tokens = by_class[c]
+
+        if len(tokens) > max_traj:
+
+            idx = rng.choice(len(tokens), size=max_traj, replace=False)
+
+            tokens = [tokens[i] for i in idx]
+
+        ok_count = 0
+        endpoints = []
+
+        for tok in tokens:
+
+            traj_path = index[tok]["trajectory"]
+
+            xy = load_trajectory(traj_path)
+
+            if xy is None or xy.shape[0] < 2:
+
+                parse_errors += 1
+
+                continue
+
+            origin = np.zeros((1, 2), dtype=np.float32)
+
+            xy_full = np.concatenate([origin, xy], axis=0)
+
+            ax.plot(xy_full[:, 0], xy_full[:, 1],
+                    color=col, alpha=0.15, lw=0.9, zorder=2)
+
+            ax.scatter(xy[-1, 0], xy[-1, 1],
+                       s=12, color=col, alpha=0.5,
+                       linewidths=0, zorder=3)
+
+            endpoints.append(xy[-1])
+
+            ok_count += 1
+
+        anc = anchors[c]
+
+        ax.scatter(anc[:, 0], anc[:, 1],
+                   s=200, color="#1A1A2E", marker="*",
+                   zorder=6, linewidths=0.5, edgecolors="white",
+                   label=f"Anchors (Ka={anc.shape[0]})")
+
+        ax.scatter(0, 0, s=90, color="black", marker="D", zorder=7,
+                   label="Ego origin")
+
+        ax.annotate("", xy=(3, 0), xytext=(0, 0),
+                    arrowprops=dict(arrowstyle="->", color="black", lw=1.5))
+
+        if endpoints:
+
+            ep_arr = np.stack(endpoints)
+
+            med_dist = float(np.median(np.linalg.norm(ep_arr, axis=1)))
+
+            title_extra = f"  |  median dist={med_dist:.1f} m"
+
+        else:
+
+            title_extra = ""
+
+        ax.set_title(f"{name}\n(n={ok_count} trajectories{title_extra})",
+                     fontsize=11, fontweight="bold", color=col)
+
+        ax.set_xlabel("x  (ego-forward, m)", fontsize=10)
+        ax.set_ylabel("y  (ego-left, m)", fontsize=10)
+
+        ax.axhline(0, color="grey", lw=0.5, ls="--", alpha=0.4)
+        ax.axvline(0, color="grey", lw=0.5, ls="--", alpha=0.4)
+
+        ax.set_aspect("equal", adjustable="datalim")
+
+        ax.grid(True, alpha=0.18)
+
+        ax.legend(fontsize=8, loc="upper left", framealpha=0.8)
+
+        print(f"  class {c} ({EMOE_SCENE_TYPES[c]:<30s}): {ok_count} plotted")
+
+    for i in range(6, len(axes)):
+        axes[i].set_visible(False)
+
+    if parse_errors:
+        warn(f"{parse_errors} files failed to parse")
+
+    fig.suptitle(
+        "EMoE Planner — GT Trajectory Spaghetti + KMeans Anchors  (ego frame)\n"
+        "Each line = 8s GT future  |  dot = 8s endpoint  |  ★ = KMeans anchor",
+        fontsize=13, fontweight="bold",
+    )
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    out_path = out_dir / "fig4_trajectory_spaghetti.png"
+
+    fig.savefig(out_path, bbox_inches="tight", dpi=150)
+
+    plt.close(fig)
+
+    ok(f"Saved → {out_path}")
+
 # ──────────────────────────────────────────────────────────────────────────────
 
 def main():
 
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--cache_dir", type=str, required=True)
-    parser.add_argument("--labels_path", type=str, required=True)
+    parser.add_argument("--cache_dir",    type=str, required=True)
+    parser.add_argument("--labels_path",  type=str, required=True)
     parser.add_argument("--anchors_path", type=str, default=None)
-    parser.add_argument("--out_dir", type=str, default="./emoe_viz")
+    parser.add_argument("--out_dir",      type=str, default="./emoe_viz")
 
     parser.add_argument("--mode", type=str, default="explore",
-                        choices=["explore","plot"])
+                        choices=["explore", "plot"])
 
     parser.add_argument("--max_traj", type=int, default=300)
-
-    parser.add_argument("--history_samples", type=int, default=20)
-
-    parser.add_argument("--future_samples", type=int, default=80)
-
-    parser.add_argument("--use_full_traj", action="store_true")
 
     args = parser.parse_args()
 
     if args.mode == "explore":
 
-        explore_mode(Path(args.cache_dir),
-                     Path(args.labels_path),
-                     args.history_samples,
-                     args.future_samples)
+        explore_mode(Path(args.cache_dir), Path(args.labels_path))
 
     else:
 
-        raise ValueError("Plot mode implementation unchanged")
+        if args.anchors_path is None:
+
+            raise ValueError("--anchors_path required for plot mode")
+
+        plot_mode(
+            Path(args.cache_dir),
+            Path(args.labels_path),
+            Path(args.anchors_path),
+            Path(args.out_dir),
+            args.max_traj,
+        )
 
 
 if __name__ == "__main__":
