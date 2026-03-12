@@ -1,155 +1,261 @@
 #!/usr/bin/env python3
 """
-nuPlan heading convention verification.
+Deep check for misclassified tokens.
 
-Confirms that nuPlan uses clockwise-positive heading (opposite to standard
-math convention), based on the observed data:
+For each wrong-side token, loads:
 
-- delta_h_deg = +42 to +75  (positive, classifier said left turn)
-- traj_y < 0                (trajectory ends to the RIGHT in ego frame)
-- conn_best_type = LEFT      (connector agrees with wrong classification)
+1. trajectory.gz — what direction did ego actually go
+2. scene_labels.jsonl — what delta_heading did the precompute script see
 
-Conclusion: positive delta_heading = clockwise = RIGHT turn in nuPlan.
+Then re-derives the endpoint direction from delta_heading to see
+if the discrepancy is in the precompute or in the trajectory.
 
-Required fix in classify_strict_intersection_logic():
-WRONG:  geom_cls = 0 if delta_heading > 0.0 else 2
-FIXED:  geom_cls = 2 if delta_heading > 0.0 else 0
+Usage:
+python deep_check_misclassified.py \
+--cache_dir   ./nuplan_cache \
+--labels_path ./emoe_precomputed/scene_labels.jsonl \
+--class_id    0
 """
 
+import gzip
+import json
 import math
+import pickle
+import argparse
+from pathlib import Path
+
 import numpy as np
 
 
-def ego_frame_y(dx_global, dy_global, heading):
+EMOE_SCENE_TYPES = [
+    "left_turn_at_intersection",
+    "straight_at_intersection",
+    "right_turn_at_intersection",
+    "straight_non_intersection",
+    "roundabout",
+    "u_turn",
+    "others",
+]
+
+WRONG_SIDE = {
+    0: lambda y: y < 0,
+    2: lambda y: y > 0,
+}
+
+
+def load_emoe_class(feat_path: Path):
+    try:
+        raw = pickle.load(gzip.open(feat_path, "rb"))
+        inner = raw["data"]
+
+        if hasattr(inner, "data"):
+            inner = inner.data
+
+        if not isinstance(inner, dict):
+            return None
+
+        emoe = inner.get("emoe")
+        if emoe is None:
+            return None
+
+        val = emoe.get("emoe_class_id")
+        if val is None:
+            return None
+
+        if hasattr(val, "item"):
+            val = val.item()
+
+        return int(val)
+
+    except Exception:
+        return None
+
+
+def load_full_trajectory(traj_path: Path):
+    """Load full trajectory array from trajectory.gz."""
+    try:
+        raw = pickle.load(gzip.open(traj_path, "rb"))
+        arr = np.array(raw["data"] if isinstance(raw, dict) else raw)
+        return arr
+    except Exception:
+        return None
+
+
+def predicted_endpoint_from_delta_h(delta_h_deg: float, dist: float = 30.0):
     """
-    Transform a global displacement into ego frame.
-    ego frame: x = forward, y = left
-    rotate by -heading (standard math convention)
+    Given a net heading change (degrees) and approximate travel distance,
+    estimate where ego ends up in ego frame (x=forward, y=left).
     """
-    c = math.cos(-heading)
-    s = math.sin(-heading)
-
-    x_ego = c * dx_global - s * dy_global
-    y_ego = s * dx_global + c * dy_global
-
-    return x_ego, y_ego
-
-
-def simulate_turn(heading_start_deg, heading_end_deg, label=""):
-    """
-    Given start and end headings, compute delta_heading and
-    predict which direction ego turned based on trajectory y sign.
-    """
-
-    h0 = math.radians(heading_start_deg)
-    hT = math.radians(heading_end_deg)
-
-    dh = (hT - h0 + math.pi) % (2 * math.pi) - math.pi  # wrap_to_pi
-
-    # approximate endpoint: ego travels 30m along arc
-    avg_heading = h0 + dh / 2
-    dist = 30.0
-
-    dx = dist * math.cos(avg_heading)
-    dy = dist * math.sin(avg_heading)
-
-    x_ego, y_ego = ego_frame_y(dx, dy, h0)
-
-    direction = "RIGHT (y<0)" if y_ego < 0 else "LEFT (y>0)"
-    sign = "positive" if dh > 0 else "negative"
-
-    print(
-        f"  {label:<30s}  delta_h={math.degrees(dh):+7.1f}°"
-        f"  ({sign:>8s})  ego_y={y_ego:+6.1f}m  → {direction}"
-    )
+    dh = math.radians(delta_h_deg)
+    avg = dh / 2.0
+    dx = dist * math.cos(avg)
+    dy = dist * math.sin(avg)
+    return dx, dy
 
 
 def main():
 
-    print("=" * 75)
-    print("  nuPlan Heading Convention Check")
-    print("=" * 75)
-    print()
+    parser = argparse.ArgumentParser()
 
-    print("  Standard math: counterclockwise = positive = LEFT turn")
-    print("  nuPlan:        clockwise = positive (map y-axis points down)")
-    print()
+    parser.add_argument("--cache_dir", type=str, required=True)
+    parser.add_argument("--labels_path", type=str, required=True)
+    parser.add_argument("--class_id", type=int, default=0)
 
-    print("  Simulating turns (ego travels 30m along arc):")
-    print()
+    args = parser.parse_args()
 
-    print(
-        f"  {'scenario':<30s}  {'delta_h':>10s}  {'sign':>10s}  "
-        f"{'ego_y':>9s}  direction"
+    cache_dir = Path(args.cache_dir)
+
+    class_name = (
+        EMOE_SCENE_TYPES[args.class_id]
+        if args.class_id < len(EMOE_SCENE_TYPES)
+        else f"class_{args.class_id}"
     )
-    print("  " + "─" * 71)
 
-    # Standard cases
-    simulate_turn(0, 45, "heading 0→45° (CCW)")
-    simulate_turn(0, -45, "heading 0→-45° (CW)")
-    simulate_turn(90, 135, "heading 90→135° (CCW)")
-    simulate_turn(90, 45, "heading 90→45° (CW)")
+    label_map = {}
 
-    print()
-    print("  Your observed misclassified tokens (delta_h +42° to +75°, traj_y < 0):")
-    print()
+    with open(args.labels_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                r = json.loads(line)
+                label_map[r["token"]] = r
+            except Exception:
+                continue
 
-    for dh_deg in [42, 55, 68, 75]:
-        simulate_turn(0, dh_deg, f"heading 0→{dh_deg}° (your data)")
+    print(f"[INFO] Loaded {len(label_map)} labels")
+    print(f"[INFO] Deep-checking wrong-side class {args.class_id} ({class_name})\n")
 
-    print()
-    print("=" * 75)
-    print("  CONCLUSION")
-    print("=" * 75)
-    print()
+    wrong_side_fn = WRONG_SIDE.get(args.class_id, lambda y: False)
 
-    # check representative value
-    h0 = 0.0
-    dh = math.radians(55)
+    found = 0
 
-    avg_heading = h0 + dh / 2
+    for log_dir in sorted(cache_dir.iterdir()):
+        if not log_dir.is_dir():
+            continue
 
-    dx = 30 * math.cos(avg_heading)
-    dy = 30 * math.sin(avg_heading)
+        for tag_dir in sorted(log_dir.iterdir()):
+            if not tag_dir.is_dir():
+                continue
 
-    _, y_ego = ego_frame_y(dx, dy, h0)
+            for tok_dir in sorted(tag_dir.iterdir()):
+                if not tok_dir.is_dir():
+                    continue
 
-    if y_ego < 0:
+                feat_p = tok_dir / "features.gz"
+                traj_p = tok_dir / "trajectory.gz"
 
-        print("  ✓ Confirmed: positive delta_heading → traj_y < 0 → RIGHT turn")
-        print("  ✓ nuPlan heading is CLOCKWISE-POSITIVE")
-        print()
+                if not feat_p.exists() or not traj_p.exists():
+                    continue
 
-        print("  Required fix in classify_strict_intersection_logic():")
-        print()
-        print("    WRONG:  geom_cls = 0 if delta_heading > 0.0 else 2")
-        print("    FIXED:  geom_cls = 2 if delta_heading > 0.0 else 0")
-        print()
+                cid = load_emoe_class(feat_p)
 
-        print("  Also update the comment:")
-        print("    # nuPlan heading: clockwise-positive, so delta>0 = right turn")
+                if cid != args.class_id:
+                    continue
 
+                arr = load_full_trajectory(traj_p)
+
+                if arr is None:
+                    continue
+
+                last_y = float(arr[-1, 1]) if arr.shape[1] >= 2 else 0.0
+                last_x = float(arr[-1, 0])
+
+                if not wrong_side_fn(last_y):
+                    continue
+
+                found += 1
+                tok = tok_dir.name
+
+                rec = label_map.get(tok, {})
+                dbg = rec.get("debug", {})
+
+                delta_h = dbg.get("delta_heading_deg")
+                ep_xy = rec.get("endpoint_xy")
+                dist = rec.get("travel_distance_m", 30.0)
+
+                print("=" * 70)
+                print(f"[{found}] token = {tok}")
+                print("=" * 70)
+
+                print("\n  ── trajectory.gz ──")
+                print(f"  shape            : {arr.shape}")
+                print(
+                    f"  cols             : {'(x,y,heading)' if arr.shape[1]==3 else '(x,y)'}"
+                )
+
+                for t in range(arr.shape[0]):
+                    row = "  ".join(f"{v:+8.3f}" for v in arr[t])
+                    marker = (
+                        " ← present+1s"
+                        if t == 0
+                        else (" ← ENDPOINT" if t == arr.shape[0] - 1 else "")
+                    )
+                    print(f"  t={t+1}s  [{row}]{marker}")
+
+                traj_dir = "LEFT (y>0)" if last_y > 0 else "RIGHT (y<0)"
+
+                print(
+                    f"\n  trajectory endpoint : x={last_x:+.2f}  y={last_y:+.2f}  → {traj_dir}"
+                )
+
+                print("\n  ── precompute (scene_labels.jsonl) ──")
+                print(f"  stage            : {rec.get('stage', '?')}")
+                print(f"  delta_h_deg      : {delta_h}")
+                print(f"  abs_dh_deg       : {dbg.get('abs_delta_heading_deg')}")
+                print(f"  travel_dist_m    : {dist:.2f}")
+                print(f"  endpoint_xy      : {ep_xy}")
+
+                if ep_xy:
+                    ep_dir = "LEFT (y>0)" if ep_xy[1] > 0 else "RIGHT (y<0)"
+                    print(f"  endpoint direction: {ep_dir}")
+
+                print("\n  ── Agreement check ──")
+
+                if ep_xy:
+
+                    precompute_left = ep_xy[1] > 0
+                    traj_left = last_y > 0
+
+                    if precompute_left == traj_left:
+                        print("  ✓ precompute endpoint and trajectory AGREE on direction")
+                        print(f"    → both say {'LEFT' if traj_left else 'RIGHT'}")
+                        print("    → classifier assigned wrong class despite correct geometry")
+                        print("    → BUG IS IN CLASSIFIER LOGIC")
+                    else:
+                        print("  ✗ precompute endpoint and trajectory DISAGREE")
+                        print(
+                            f"    precompute says: {'LEFT' if precompute_left else 'RIGHT'}"
+                        )
+                        print(
+                            f"    trajectory says: {'LEFT' if traj_left else 'RIGHT'}"
+                        )
+                        print("    → FRAME MISMATCH between precompute and trajectory.gz")
+
+                else:
+                    print("  ? endpoint_xy not in labels — cannot compare")
+
+                print("\n  ── connector ──")
+                print(f"  conn_best_type   : {dbg.get('connector_best_type')}")
+                print(f"  conn_best_ratio  : {dbg.get('connector_best_ratio')}")
+                print(f"  turn_counts      : {dbg.get('connector_turn_counts')}")
+                print(f"  lane_follow_ok   : {dbg.get('lane_following_ok')}")
+                print(f"  lane_med_err_deg : {dbg.get('lane_following_median_err_deg')}")
+                print()
+
+    if found == 0:
+        print("No wrong-side tokens found.")
     else:
-
-        print("  ✗ Unexpected: positive delta_heading → traj_y > 0 → LEFT turn")
-        print("  nuPlan heading appears to be standard CCW-positive.")
-        print("  The misclassification has a different cause — investigate further.")
-
-    print()
-    print("=" * 75)
-    print("  CONNECTOR TURN TYPE NOTE")
-    print("=" * 75)
-    print()
-
-    print("  conn_best_type = LEFT for all 6 wrong tokens.")
-    print("  Since connector agreed with the wrong classification,")
-    print("  LaneConnectorType.LEFT likely also uses clockwise convention,")
-    print("  meaning LEFT=1 in nuPlan maps = rightward turn in world frame.")
-    print("  The connector is NOT providing independent verification —")
-    print("  it shares the same flipped convention.")
-    print()
-    print("  The connector verification logic does not need changing.")
-    print("  Only the geometry sign in geom_cls needs the one-line fix.")
+        print(f"\n[DONE] Found {found} wrong-side tokens for class {args.class_id}")
+        print(
+            """
+Summary of what to look for:
+✓ precompute + traj AGREE  → classifier logic bug
+✗ precompute + traj DISAGREE → frame mismatch
+? no endpoint_xy in labels → rebuild labels with endpoint_xy
+"""
+        )
 
 
 if __name__ == "__main__":
