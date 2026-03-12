@@ -122,39 +122,41 @@ def load_trajectory(path: Path):
     except Exception:
         return None
 
-def load_emoe_class(path: Path):
-    """
-    Read class label from features.gz:
-    data["emoe"]["scene_label"] -> int
-    Returns None if not present (unlabelled / simulation snapshot).
-    """
+from typing import Optional
+
+def load_emoe_class(path: Path) -> Optional[int]:
     try:
-        data = load_gz_raw(path)
+        with gzip.open(path, "rb") as f:
+            obj = pickle.load(f)
 
-        # PlutoFeature instance
-        if hasattr(data, "data"):
-            data = data.data
-        if hasattr(data, "serialize"):
-            data = data.serialize()["data"]
+        # features.gz is saved as {"data": PlutoFeature_instance}
+        # PlutoFeature_instance.data is the raw dict
+        if isinstance(obj, dict) and "data" in obj:
+            obj = obj["data"]
 
-        if not isinstance(data, dict):
+        # obj is now either a PlutoFeature instance or the raw data dict
+        if hasattr(obj, "data"):          # PlutoFeature instance
+            inner = obj.data
+        elif isinstance(obj, dict):       # raw dict directly
+            inner = obj
+        else:
             return None
 
-        emoe = data.get("emoe")
+        emoe = inner.get("emoe")
         if emoe is None:
             return None
 
-        # handle torch tensor or numpy scalar
-        val = emoe.get("scene_label")
+        val = emoe.get("emoe_class_id")   # correct key
         if val is None:
             return None
+
         if hasattr(val, "item"):
             val = val.item()
+
         return int(val)
 
     except Exception:
         return None
-
 # ──────────────────────────────────────────────────────────────────────────────
 # EXPLORE MODE
 # ──────────────────────────────────────────────────────────────────────────────
