@@ -165,8 +165,8 @@ class PlutoFeatureBuilder(AbstractFeatureBuilder):
         if "emoe" not in data:
             data["emoe"] = {}
 
-        data["emoe"]["scene_label"] = info["class_id"]
-        data["emoe"]["scene_class_name"] = info["class_name"]
+        data["emoe"]["emoe_class_id"] = info["class_id"]
+        #data["emoe"]["scene_class_name"] = info["class_name"]
 
     # ----------------------------------------------------------------------
     # Standard nuPlan feature builder plumbing
