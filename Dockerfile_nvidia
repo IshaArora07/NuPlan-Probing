@@ -1,49 +1,38 @@
-FROM nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu20.04
+FROM 763104351884.dkr.ecr.eu-west-1.amazonaws.com/pytorch-training:2.0.1-gpu-py39-cu118-ubuntu20.04-ec2
 
 WORKDIR /workspace
 
-# ---- proxy (if needed) ----
-ARG HTTP_PROXY
-ARG HTTPS_PROXY
-
-ENV HTTP_PROXY=$HTTP_PROXY
-ENV HTTPS_PROXY=$HTTPS_PROXY
-ENV http_proxy=$HTTP_PROXY
-ENV https_proxy=$HTTPS_PROXY
-
-# ---- system deps ----
-RUN apt-get update && apt-get install -y \
-    python3.9 python3.9-dev python3.9-distutils \
-    python3-pip git curl wget build-essential \
- && rm -rf /var/lib/apt/lists/*
-
-# ---- set python3.9 as default ----
-RUN ln -sf /usr/bin/python3.9 /usr/bin/python
-RUN ln -sf /usr/bin/python3.9 /usr/bin/python3
-
-# ---- upgrade pip ----
-RUN python -m pip install --upgrade pip
-
-# ---- copy code ----
+# -----------------------------
+# Copy code (adjust paths carefully)
+# -----------------------------
 COPY nuplan-devkit/ /workspace/nuplan-devkit/
 COPY Thesis/ /workspace/emoe/
 
-# ---- install torch ----
-RUN pip install torch==2.0.1 torchvision==0.15.2 \
-    --index-url https://download.pytorch.org/whl/cu118
+# -----------------------------
+# Upgrade pip (important)
+# -----------------------------
+RUN pip install --upgrade pip setuptools wheel
 
-# ---- install natten (local wheel) ----
+# -----------------------------
+# Install natten (wheel only)
+# -----------------------------
 COPY natten*.whl /workspace/
 RUN pip install /workspace/natten*.whl
 
-# ---- install nuplan ----
+# -----------------------------
+# Install nuPlan FIRST
+# -----------------------------
 RUN pip install -e /workspace/nuplan-devkit
-RUN pip install -r /workspace/nuplan-devkit/requirements.txt
 
-# ---- install your EMOE ----
+# -----------------------------
+# Install dependencies
+# -----------------------------
+RUN pip install -r /workspace/nuplan-devkit/requirements.txt
 RUN pip install -r /workspace/emoe/requirements.txt
 
-# ---- entrypoint ----
+# -----------------------------
+# Entrypoint
+# -----------------------------
 COPY entrypoint.sh /workspace/entrypoint.sh
 RUN chmod +x /workspace/entrypoint.sh
 
