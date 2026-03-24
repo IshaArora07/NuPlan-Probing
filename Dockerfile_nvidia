@@ -1,54 +1,45 @@
-# Stage 1: get Python 3.9 from official image
-FROM python:3.9-slim AS python-base
-
-# Stage 2: final image
-FROM nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu20.04
+FROM nvidia/cuda:12.1.0-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 WORKDIR /workspace
 
-# ---- copy Python 3.9 from official image ----
-COPY --from=python-base /usr/local/lib/python3.9 /usr/local/lib/python3.9
-COPY --from=python-base /usr/local/bin/python3.9 /usr/local/bin/python3.9
-COPY --from=python-base /usr/local/bin/pip3.9 /usr/local/bin/pip3.9
-COPY --from=python-base /usr/local/include/python3.9 /usr/local/include/python3.9
-COPY --from=python-base /usr/local/lib/libpython3.9* /usr/local/lib/
-
-# ---- basic system deps, all in default Ubuntu repos, no PPA needed ----
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# ---- install Python 3.9 ----
+RUN apt-get update && apt-get install -y \
+    python3.9 \
+    python3.9-dev \
+    python3.9-distutils \
+    python3-pip \
     git \
     curl \
     wget \
     build-essential \
     ca-certificates \
-    libexpat1 \
  && rm -rf /var/lib/apt/lists/*
 
-# ---- set python3.9 as default ----
-RUN ln -sf /usr/local/bin/python3.9 /usr/bin/python && \
-    ln -sf /usr/local/bin/python3.9 /usr/bin/python3 && \
-    ln -sf /usr/local/bin/pip3.9 /usr/bin/pip
+# ---- set python3.9 default ----
+RUN ln -sf /usr/bin/python3.9 /usr/bin/python && \
+    ln -sf /usr/bin/python3.9 /usr/bin/python3
 
 # ---- upgrade pip ----
 RUN python -m pip install --upgrade pip setuptools wheel
-
-# ---- copy code ----
-COPY nuplan-devkit/ /workspace/nuplan-devkit/
-COPY Thesis/ /workspace/emoe/
 
 # ---- install torch ----
 RUN pip install torch==2.0.1 torchvision==0.15.2 \
     --index-url https://download.pytorch.org/whl/cu118
 
-# ---- install natten (local wheel) ----
+# ---- copy code ----
+COPY nuplan-devkit/ /workspace/nuplan-devkit/
+COPY Thesis/ /workspace/emoe/
+
+# ---- natten ----
 COPY natten*.whl /workspace/
 RUN pip install /workspace/natten*.whl
 
-# ---- install nuplan-devkit ----
+# ---- install nuplan ----
 RUN pip install -e /workspace/nuplan-devkit
 RUN pip install -r /workspace/nuplan-devkit/requirements.txt
 
-# ---- install EMoE ----
+# ---- EMoE ----
 RUN pip install -r /workspace/emoe/requirements.txt
 
 # ---- entrypoint ----
