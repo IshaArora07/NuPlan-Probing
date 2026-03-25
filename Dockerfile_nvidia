@@ -1,46 +1,45 @@
-FROM nvidia/cuda:12.1.0-runtime-ubuntu22.04
+FROM python:3.9-slim
 
 ENV DEBIAN_FRONTEND=noninteractive
 WORKDIR /workspace
 
-# ---- install Python (use system default = 3.10) ----
-RUN apt-get update && apt-get install -y \
-    python3 \
-    python3-pip \
-    python3-dev \
-    python3-distutils \
+# ---- install CUDA dependencies manually instead of using nvidia base ----
+RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     curl \
     wget \
     build-essential \
     ca-certificates \
+    libexpat1 \
+    # CUDA runtime libs
+    libcublas-11-8 \
+    libcudnn8 \
+    libcufft-11-8 \
+    libcurand-11-8 \
+    libcusolver-11-8 \
+    libcusparse-11-8 \
  && rm -rf /var/lib/apt/lists/*
-
-# ---- set python default ----
-RUN ln -sf /usr/bin/python3 /usr/bin/python
 
 # ---- upgrade pip ----
 RUN python -m pip install --upgrade pip setuptools wheel
-
-# ---- install torch ----
-RUN pip install torch==2.0.1 torchvision==0.15.2 \
-    --index-url https://download.pytorch.org/whl/cu118
 
 # ---- copy code ----
 COPY nuplan-devkit/ /workspace/nuplan-devkit/
 COPY Thesis/ /workspace/emoe/
 
-# ---- natten ----
+# ---- install torch (brings its own CUDA runtime, no system CUDA needed) ----
+RUN pip install torch==2.0.1 torchvision==0.15.2 \
+    --index-url https://download.pytorch.org/whl/cu118
+
+# ---- install natten ----
 COPY natten*.whl /workspace/
 RUN pip install /workspace/natten*.whl
 
-# ---- install nuplan ----
+# ---- install nuplan-devkit ----
 RUN pip install -e /workspace/nuplan-devkit
+RUN pip install -r /workspace/nuplan-devkit/requirements.txt
 
-# ⚠️ OPTIONAL: skip if conflicts
-# RUN pip install -r /workspace/nuplan-devkit/requirements.txt
-
-# ---- EMoE ----
+# ---- install EMoE ----
 RUN pip install -r /workspace/emoe/requirements.txt
 
 # ---- entrypoint ----
