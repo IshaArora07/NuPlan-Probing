@@ -3,14 +3,24 @@ FROM python:3.9-slim
 ENV DEBIAN_FRONTEND=noninteractive
 WORKDIR /workspace
 
-# ---- basic system deps only ----
+# ---- basic system deps ----
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     curl \
     wget \
     build-essential \
     ca-certificates \
+    unzip \
  && rm -rf /var/lib/apt/lists/*
+
+# ---- install AWS CLI ----
+RUN curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip" && \
+    unzip awscliv2.zip && \
+    ./aws/install && \
+    rm -rf awscliv2.zip aws/
+
+# ---- verify AWS CLI ----
+RUN aws --version
 
 # ---- upgrade pip ----
 RUN python -m pip install --upgrade pip setuptools wheel
@@ -19,7 +29,7 @@ RUN python -m pip install --upgrade pip setuptools wheel
 COPY nuplan-devkit/ /workspace/nuplan-devkit/
 COPY Thesis/ /workspace/emoe/
 
-# ---- install torch (bundles its own CUDA 11.8 runtime internally) ----
+# ---- install torch ----
 RUN pip install torch==2.0.1 torchvision==0.15.2 \
     --index-url https://download.pytorch.org/whl/cu118
 
