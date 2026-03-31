@@ -382,6 +382,16 @@ class LightningTrainer(pl.LightningModule):
         top_k_traj = trajectory[torch.arange(bs)[:, None], top_k_index]
 
         if self.global_step == 0:
+            ego_target = data["agent"]["target"][:, 0]
+            pred_target = data["agent"]["target"][:, 1:]
+
+            print(f"[DIAG] ego target xy range:  {ego_target[..., :2].abs().max().item():.3f}  ← should be <10")
+            print(f"[DIAG] pred target xy range: {pred_target[..., :2].abs().max().item():.3f}  ← should be <10")
+            print(f"[DIAG] traj xy range:        {top_k_traj[..., :2].abs().max().item():.3f}   ← should be <10")
+            print(f"[DIAG] prediction xy range:  {res['prediction'][..., :2].abs().max().item():.3f}  ← should be <10")
+
+
+        if self.global_step == 0:
             ego_target = data["agent"]["position"][:, 0, self.history_steps:]        
             pred_target = data["agent"]["position"][:, 1:, self.history_steps:]
 
