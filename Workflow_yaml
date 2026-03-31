@@ -1,0 +1,343 @@
+metadata:
+  name: isha-emoe-training
+  namespace: aiplainner-dev
+  annotations:
+    artifacts-bucket: "<redacted>"
+    katib-objective-metric-name: ""
+    katib-objective-metric-strategy: ""
+    katib-trial-id: ""
+    workflow-parameters-schema: ""
+
+spec:
+  templates:
+
+    # ------------------------------------------------------------------
+    # Top-level step orchestration
+    # ------------------------------------------------------------------
+    - name: train-emoe-steps
+      inputs:
+        parameters:
+          - name: log_param_prefixes
+          - name: log_level_as_int
+      outputs: {}
+      metadata: {}
+      steps:
+        - - name: prepare-env
+            template: prepare-environment
+            arguments:
+              parameters:
+                - name: workflow_parameters
+                  value: "{{workflow.parameters.json}}"
+                - name: namespace
+                  value: "{{workflow.namespace}}"
+                - name: uid
+                  value: "{{workflow.uid}}"
+                - name: katib_trial_id
+                  value: "{{workflow.annotations.katib-trial-id}}"
+                - name: run_config_output_path
+                  value: "/tmp/outputs/run_config.json"
+                - name: output_html_path
+                  value: "/tmp/outputs/traceability_links.html"
+                - name: pipeline_artifacts_mount_path
+                  value: "{{workflow.parameters.pipeline_artifacts_mount_path}}"
+                - name: use_bk25_data
+                  value: "true"
+
+        - - name: start-mlflow-run
+            template: start-mlflow-run
+            arguments:
+              parameters:
+                - name: mlflow_uri
+                  value: "{{workflow.parameters.mlflow_uri}}"
+                - name: mlflow_experiment_name
+                  value: "{{workflow.parameters.mlflow_experiment_name}}"
+                - name: parent_mlflow_run_id
+                  value: ""
+                - name: workflow_namespace
+                  value: "{{workflow.namespace}}"
+                - name: workflow_uid
+                  value: "{{workflow.uid}}"
+                - name: workflow_name
+                  value: "{{workflow.name}}"
+                - name: output_path
+                  value: "{{=jsonpath(steps['prepare-env'].outputs.parameters.run_config, '$.artifact_paths.output_path')}}"
+                - name: stream
+                  value: "{{workflow.parameters.stream}}"
+                - name: unique_run_path
+                  value: "{{=jsonpath(steps['prepare-env'].outputs.parameters.run_config, '$.artifact_paths.unique_run_path')}}"
+                - name: tags
+                  value: "{{workflow.parameters.tags}}"
+                - name: annotations
+                  value: "{{workflow.annotations}}"
+                - name: pipeline_parameters
+                  value: "{{workflow.parameters.json}}"
+                - name: log_param_prefixes
+                  value: "{{inputs.parameters.log_param_prefixes}}"
+                - name: mlflow_run_id_output_path
+                  value: "/tmp/mlflow_run_id"
+                - name: log_level
+                  value: "{{inputs.parameters.log_level_as_int}}"
+
+        - - name: train-emoe
+            template: train-emoe
+            arguments:
+              parameters:
+                - name: s3_data_root
+                  value: "{{workflow.parameters.train-emoe__s3_data_root}}"
+                - name: batch_size
+                  value: "{{workflow.parameters.train-emoe__batch_size}}"
+                - name: learning_rate
+                  value: "{{workflow.parameters.train-emoe__learning_rate}}"
+                - name: weight_decay
+                  value: "{{workflow.parameters.train-emoe__weight_decay}}"
+                - name: epochs
+                  value: "{{workflow.parameters.train-emoe__epochs}}"
+                - name: warmup_epochs
+                  value: "{{workflow.parameters.train-emoe__warmup_epochs}}"
+                - name: num_gpus
+                  value: "{{workflow.parameters.train-emoe__num_gpus}}"
+                - name: num_workers
+                  value: "{{=sprig.max(sprig.int(workflow.parameters['train-emoe__num_gpus']), 1) * 12}}"
+                - name: max_workers
+                  value: "{{workflow.parameters.train-emoe__max_workers}}"
+                - name: warm_start_checkpoint_path
+                  value: "{{workflow.parameters.train-emoe__warm_start_checkpoint_path}}"
+
+    # ------------------------------------------------------------------
+    # prepare-environment: unchanged from company template
+    # ------------------------------------------------------------------
+    - name: prepare-environment
+      inputs:
+        parameters:
+          - name: workflow_parameters
+          - name: namespace
+          - name: uid
+          - name: katib_trial_id
+          - name: run_config_output_path
+          - name: output_html_path
+          - name: pipeline_artifacts_mount_path
+          - name: use_bk25_data
+      outputs:
+        parameters:
+          - name: run_config
+            valueFrom:
+              path: "{{inputs.parameters.run_config_output_path}}"
+      metadata:
+        annotations:
+          karpenter.sh/do-not-disrupt: "true"
+      container:
+        name: ""
+        image: "<redacted>"
+        command:
+          - "<redacted>"
+        args:
+          - "--workflow_parameters"
+          - "{{inputs.parameters.workflow_parameters}}"
+          - "--namespace"
+          - "{{inputs.parameters.namespace}}"
+          - "--uid"
+          - "{{inputs.parameters.uid}}"
+          - "--katib_trial_id"
+          - "{{inputs.parameters.katib_trial_id}}"
+          - "--run_config_output_path"
+          - "{{inputs.parameters.run_config_output_path}}"
+          - "--output_html_path"
+          - "{{inputs.parameters.output_html_path}}"
+          - "--pipeline_artifacts_mount_path"
+          - "{{inputs.parameters.pipeline_artifacts_mount_path}}"
+          - "--use_bk25_data"
+          - "{{inputs.parameters.use_bk25_data}}"
+        envFrom:
+          - configMapRef:
+              name: cluster-info
+        env:
+          - name: WORKFLOW_PARAMETERS_SCHEMA
+            value: "{{workflow.annotations.workflow-parameters-schema}}"
+        resources:
+          limits:
+            memory: "100Mi"
+      volumeMounts:
+        - name: persistent-storage
+          mountPath: "{{workflow.parameters.pipeline_artifacts_mount_path}}"
+
+    # ------------------------------------------------------------------
+    # start-mlflow-run: unchanged from company template
+    # ------------------------------------------------------------------
+    - name: start-mlflow-run
+      inputs:
+        parameters:
+          - name: mlflow_uri
+          - name: mlflow_experiment_name
+          - name: parent_mlflow_run_id
+          - name: workflow_namespace
+          - name: workflow_uid
+          - name: workflow_name
+          - name: output_path
+          - name: stream
+          - name: unique_run_path
+          - name: tags
+          - name: annotations
+          - name: pipeline_parameters
+          - name: log_param_prefixes
+          - name: mlflow_run_id_output_path
+          - name: log_level
+      outputs:
+        parameters:
+          - name: mlflow_run_id
+            valueFrom:
+              path: /tmp/mlflow_run_id
+            globalName: MLFLOW_RUN_ID
+      metadata:
+        annotations:
+          karpenter.sh/do-not-disrupt: "true"
+      container:
+        name: ""
+        image: "<redacted>"
+        command:
+          - python3
+          - "<redacted>"
+        args:
+          - "--mlflow_uri"
+          - "{{inputs.parameters.mlflow_uri}}"
+          - "--mlflow_experiment_name"
+          - "{{inputs.parameters.mlflow_experiment_name}}"
+          - "--parent_mlflow_run_id"
+          - "{{inputs.parameters.parent_mlflow_run_id}}"
+          - "--workflow_namespace"
+          - "{{inputs.parameters.workflow_namespace}}"
+          - "--workflow_uid"
+          - "{{inputs.parameters.workflow_uid}}"
+          - "--workflow_name"
+          - "{{inputs.parameters.workflow_name}}"
+          - "--output_path"
+          - "{{inputs.parameters.output_path}}"
+          - "--stream"
+          - "{{inputs.parameters.stream}}"
+          - "--unique_run_path"
+          - "{{inputs.parameters.unique_run_path}}"
+          - "--tags"
+          - "{{inputs.parameters.tags}}"
+          - "--annotations"
+          - "{{inputs.parameters.annotations}}"
+          - "--pipeline_parameters"
+          - "{{inputs.parameters.pipeline_parameters}}"
+          - "--log_param_prefixes"
+          - "{{inputs.parameters.log_param_prefixes}}"
+          - "--mlflow_run_id_output_path"
+          - "{{inputs.parameters.mlflow_run_id_output_path}}"
+          - "--log_level"
+          - "{{inputs.parameters.log_level}}"
+        envFrom:
+          - configMapRef:
+              name: cluster-info
+        resources: {}
+
+    # ------------------------------------------------------------------
+    # train-emoe: EMoE/PLUTO training step
+    # ------------------------------------------------------------------
+    - name: train-emoe
+      inputs:
+        parameters:
+          - name: s3_data_root
+          - name: batch_size
+          - name: learning_rate
+          - name: weight_decay
+          - name: epochs
+          - name: warmup_epochs
+          - name: num_gpus
+          - name: num_workers
+          - name: max_workers
+          - name: warm_start_checkpoint_path
+      outputs: {}
+      metadata:
+        annotations:
+          karpenter.sh/do-not-disrupt: "true"
+      containerSet:
+        containers:
+          - name: main
+            image: "<your-ecr-repo>/emoe-planner:latest"  # TO DO: replace with ECR image URI
+            command:
+              - "/workspace/entrypoint.sh"
+            env:
+              - name: S3_DATA_ROOT
+                value: "{{inputs.parameters.s3_data_root}}"
+              - name: BATCH_SIZE
+                value: "{{inputs.parameters.batch_size}}"
+              - name: NUM_WORKERS
+                value: "{{inputs.parameters.num_workers}}"
+              - name: NUM_GPUS
+                value: "{{inputs.parameters.num_gpus}}"
+              - name: LR
+                value: "{{inputs.parameters.learning_rate}}"
+              - name: EPOCHS
+                value: "{{inputs.parameters.epochs}}"
+              - name: WARMUP_EPOCHS
+                value: "{{inputs.parameters.warmup_epochs}}"
+              - name: WEIGHT_DECAY
+                value: "{{inputs.parameters.weight_decay}}"
+              - name: MAX_WORKERS
+                value: "{{inputs.parameters.max_workers}}"
+              - name: WARM_START_CHECKPOINT_PATH
+                value: "{{inputs.parameters.warm_start_checkpoint_path}}"
+            resources:
+              limits:
+                cpu: "{{inputs.parameters.num_workers}}"
+                memory: "64Gi"   # TO DO: adjust if OOM during cache sync
+                nvidia.com/gpu: "{{inputs.parameters.num_gpus}}"
+              requests:
+                cpu: "{{inputs.parameters.num_workers}}"
+                memory: "64Gi"
+                nvidia.com/gpu: "{{inputs.parameters.num_gpus}}"
+            tolerations:
+              - key: "lcp-node-type"
+                operator: "Equal"
+                value: "{{=(inputs.parameters.num_gpus != \"0\") ? ('workloads-gpu-' + inputs.parameters.num_gpus) : 'workloads-cpu'}}"
+                effect: "NoExecute"
+            volumeMounts:
+              - name: persistent-storage
+                mountPath: "{{workflow.parameters.pipeline_artifacts_mount_path}}"
+              - name: nvme-storage
+                mountPath: "/work"
+              - name: shared-memory
+                mountPath: "/dev/shm"
+        envFrom:
+          - configMapRef:
+              name: cluster-info
+        resources: {}
+
+  # ------------------------------------------------------------------
+  # Volumes: unchanged from company template
+  # ------------------------------------------------------------------
+  volumes:
+    - name: persistent-storage
+      persistentVolumeClaim:
+        claimName: "s3-pvc"
+    - name: nvme-storage
+      emptyDir: {}
+    - name: shared-memory
+      emptyDir:
+        medium: "Memory"
+        sizeLimit: "24Gi"
+
+  parallelism: 1
+  podPriorityClassName: "{{workflow.parameters.priority_class_name}}"
+
+  # ------------------------------------------------------------------
+  # Workflow-level parameters — set in Argo UI or via CLI
+  # ------------------------------------------------------------------
+  #   pipeline_artifacts_mount_path          : PVC mount path (company-provided)
+  #   mlflow_uri                             : MLflow tracking server URI
+  #   mlflow_experiment_name                 : e.g. "emoe-pluto"
+  #   stream                                 : data stream identifier
+  #   tags                                   : MLflow tags JSON
+  #   priority_class_name                    : pod priority class
+  #
+  #   train-emoe__s3_data_root               : s3://prod-pipeline/data/nuPlan_raw
+  #   train-emoe__batch_size                 : 32
+  #   train-emoe__learning_rate              : 1e-3
+  #   train-emoe__weight_decay               : 0.0001
+  #   train-emoe__epochs                     : 25
+  #   train-emoe__warmup_epochs              : 3
+  #   train-emoe__num_gpus                   : 4
+  #   train-emoe__max_workers                : 32
+  #   train-emoe__warm_start_checkpoint_path : "" (empty = train from scratch)
