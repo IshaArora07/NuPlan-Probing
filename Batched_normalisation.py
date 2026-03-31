@@ -4,6 +4,16 @@ src/utils/batch_normalize.py
 
 Applies ego-relative normalization to a collated PlutoFeature batch
 loaded from cache in global coordinates.
+
+Usage in pluto_trainer.py _step():
+from src.utils.batch_normalize import normalize_batch
+
+def _step(self, batch, prefix):
+    features, targets, scenarios = batch
+    data = features["feature"].data
+    data = normalize_batch(data)          # <-- add this line
+    res = self.forward(data)
+    ...
 """
 
 from __future__ import annotations
@@ -16,17 +26,17 @@ def wrap_to_pi(x: torch.Tensor) -> torch.Tensor:
     return (x + math.pi) % (2 * math.pi) - math.pi
 
 
-def normalize_batch(data: dict, hist_steps: int | None = None) -> dict:
+def normalize_batch(data: dict, hist_steps: int = None) -> dict:
     """
     Normalize a batched PlutoFeature from global UTM coords to ego-relative frame.
 
     Args:
-        data: collated feature dict from features["feature"].data
+        data:       collated feature dict from features["feature"].data
         hist_steps: optional history length including present index.
-                    If None, inferred from target or valid_mask.
+                    If None, inferred from target shape or valid_mask.
 
     Returns:
-        normalized data dict
+        normalized data dict (in-place modifications + returned)
     """
     assert "origin" in data, (
         "data['origin'] missing — cache was not built with first_time=True"
@@ -36,30 +46,39 @@ def normalize_batch(data: dict, hist_steps: int | None = None) -> dict:
     )
 
     # ------------------------------------------------------------------
-    # Skip if already normalized
+    # Skip if already normalized — check UTM origin magnitude, not data
+    # values, to avoid false negatives near map origin
     # ------------------------------------------------------------------
-    pos_max = data["agent"]["position"].abs().max().item()
-    if pos_max < 100.0:
-        # already likely ego-relative
-        return data
+    center_xy = data["origin"].float()    # (B, 2)
+    center_angle = data["angle"].float()  # (B,)
 
-    center_xy = data["origin"].float()
-    center_angle = data["angle"].float()
+    if center_xy.abs().max().item() < 100.0:
+        # origin is near zero → already in ego-relative frame
+        return data
 
     B = center_xy.shape[0]
 
     cos_a = torch.cos(center_angle)
     sin_a = torch.sin(center_angle)
 
+    # Rotation matrix (B, 2, 2)
+    # Matches PlutoFeature.normalize numpy convention:
+    #   rotate_mat = [[cos, -sin], [sin, cos]]
+    #   rotated = (pos - center_xy) @ rotate_mat
     R = torch.stack(
         [
             torch.stack([cos_a, -sin_a], dim=-1),
-            torch.stack([sin_a, cos_a], dim=-1),
+            torch.stack([sin_a,  cos_a], dim=-1),
         ],
         dim=1,
     )  # (B, 2, 2)
 
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
     def rot_pos(xy: torch.Tensor) -> torch.Tensor:
+        """Subtract UTM center and rotate. xy: (B, ..., 2)"""
         shape = xy.shape
         xy_f = xy.float().reshape(B, -1, 2)
         xy_c = xy_f - center_xy.unsqueeze(1)
@@ -67,12 +86,14 @@ def normalize_batch(data: dict, hist_steps: int | None = None) -> dict:
         return xy_r.reshape(shape)
 
     def rot_vec(xy: torch.Tensor) -> torch.Tensor:
+        """Rotate without subtracting center (for vectors). xy: (B, ..., 2)"""
         shape = xy.shape
         xy_f = xy.float().reshape(B, -1, 2)
         xy_r = torch.bmm(xy_f, R.transpose(1, 2))
         return xy_r.reshape(shape)
 
     def rot_angle(a: torch.Tensor) -> torch.Tensor:
+        """Subtract center_angle and wrap to [-pi, pi]. a: (B, ...)"""
         extra_dims = a.dim() - 1
         ca = center_angle
         for _ in range(extra_dims):
@@ -88,6 +109,9 @@ def normalize_batch(data: dict, hist_steps: int | None = None) -> dict:
     agent["heading"] = rot_angle(agent["heading"].clone())
     agent["velocity"] = rot_vec(agent["velocity"].clone())
 
+    if "acceleration" in agent:
+        agent["acceleration"] = rot_vec(agent["acceleration"].clone())
+
     # ------------------------------------------------------------------
     # Infer hist_steps safely
     # ------------------------------------------------------------------
@@ -97,9 +121,10 @@ def normalize_batch(data: dict, hist_steps: int | None = None) -> dict:
             T_future = agent["target"].shape[2]
             hist_steps = T_total - T_future
         else:
-            # fallback for Pluto default 2s @ 0.1s + present
+            # fallback: PLUTO default 2s history @ 0.1s + present frame
             hist_steps = 21
 
+    # Recompute target now that position + heading are in ego-relative frame
     _recompute_target(data, hist_steps)
 
     # ------------------------------------------------------------------
@@ -116,7 +141,7 @@ def normalize_batch(data: dict, hist_steps: int | None = None) -> dict:
             mp["point_orientation"] = rot_angle(mp["point_orientation"].clone())
 
         if "polygon_center" in mp:
-            pc = mp["polygon_center"].float().clone()
+            pc = mp["polygon_center"].float().clone()  # (B, M, 3)
             pc[..., :2] = rot_pos(pc[..., :2])
             pc[..., 2] = rot_angle(pc[..., 2])
             mp["polygon_center"] = pc
@@ -124,9 +149,7 @@ def normalize_batch(data: dict, hist_steps: int | None = None) -> dict:
         if "polygon_position" in mp:
             mp["polygon_position"] = rot_pos(mp["polygon_position"].clone())
         if "polygon_orientation" in mp:
-            mp["polygon_orientation"] = rot_angle(
-                mp["polygon_orientation"].clone()
-            )
+            mp["polygon_orientation"] = rot_angle(mp["polygon_orientation"].clone())
 
     # ------------------------------------------------------------------
     # Static objects
@@ -140,7 +163,7 @@ def normalize_batch(data: dict, hist_steps: int | None = None) -> dict:
             so["heading"] = rot_angle(so["heading"].clone())
 
     # ------------------------------------------------------------------
-    # Current state
+    # Current state — zero out xy and heading (matches normalize())
     # ------------------------------------------------------------------
     if "current_state" in data:
         cs = data["current_state"].float().clone()
@@ -152,30 +175,40 @@ def normalize_batch(data: dict, hist_steps: int | None = None) -> dict:
 
 def _recompute_target(data: dict, hist_steps: int) -> None:
     """
-    Recompute data["agent"]["target"] from normalized position + heading.
+    Recompute data["agent"]["target"] from already-normalized
+    position and heading.
+
+    Matches PlutoFeature.normalize() exactly:
+        target_position = position[:, hist_steps:] - position[:, hist_steps-1, None]
+        target_heading  = heading[:, hist_steps:]  - heading[:, hist_steps-1, None]
+        target = concat([target_position, target_heading], dim=-1)
+        target[~valid_mask] = 0
+
+    Output shape: (B, A, T_future, 3)
     """
-    pos = data["agent"]["position"].float()
-    hdg = data["agent"]["heading"].float()
-    vmask = data["agent"]["valid_mask"]
+    pos = data["agent"]["position"].float()    # (B, A, T_total, 2)
+    hdg = data["agent"]["heading"].float()     # (B, A, T_total)
+    vmask = data["agent"]["valid_mask"]        # (B, A, T_total)
 
     T_total = pos.shape[2]
     hist_steps = min(hist_steps, T_total - 1)
 
-    origin_pos = pos[:, :, hist_steps - 1, :]
-    origin_hdg = hdg[:, :, hist_steps - 1]
+    origin_pos = pos[:, :, hist_steps - 1, :]    # (B, A, 2)
+    origin_hdg = hdg[:, :, hist_steps - 1]       # (B, A)
 
-    fut_pos = pos[:, :, hist_steps:, :]
-    fut_hdg = hdg[:, :, hist_steps:]
+    fut_pos = pos[:, :, hist_steps:, :]          # (B, A, T_future, 2)
+    fut_hdg = hdg[:, :, hist_steps:]             # (B, A, T_future)
 
-    tgt_pos = fut_pos - origin_pos.unsqueeze(2)
-    tgt_hdg = wrap_to_pi(fut_hdg - origin_hdg.unsqueeze(2))
+    tgt_pos = fut_pos - origin_pos.unsqueeze(2)               # (B, A, T_future, 2)
+    tgt_hdg = wrap_to_pi(fut_hdg - origin_hdg.unsqueeze(2))  # (B, A, T_future)
 
     target = torch.cat(
         [tgt_pos, tgt_hdg.unsqueeze(-1)],
         dim=-1,
-    )
+    )  # (B, A, T_future, 3)
 
-    fut_mask = vmask[:, :, hist_steps:]
+    # Zero out invalid future timesteps
+    fut_mask = vmask[:, :, hist_steps:]          # (B, A, T_future)
     target = target * fut_mask.unsqueeze(-1).float()
 
     data["agent"]["target"] = target
