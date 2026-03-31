@@ -381,6 +381,31 @@ class LightningTrainer(pl.LightningModule):
         top_k_prob, top_k_index = probability.topk(6, dim=-1)
         top_k_traj = trajectory[torch.arange(bs)[:, None], top_k_index]
 
+        if self.global_step == 0:
+            ego_target = data["agent"]["position"][:, 0, self.history_steps:]        
+            pred_target = data["agent"]["position"][:, 1:, self.history_steps:]
+
+            print(f"[DIAG] ego target xy range:  {ego_target[..., :2].abs().max().item():.3f}  ← should be <10")
+            print(f"[DIAG] pred target xy range: {pred_target[..., :2].abs().max().item():.3f}  ← should be <10")
+            print(f"[DIAG] traj xy range:        {top_k_traj[..., :2].abs().max().item():.3f}   ← should be <10")
+            print(f"[DIAG] prediction xy range:  {res['prediction'][..., :2].abs().max().item():.3f}  ← should be <10")
+
+            traj_xy = trajectory[..., :2]
+            ego_target_xy = ego_target[..., :2]
+            endpoint_dist = torch.norm(
+                traj_xy[:, :, -1, :] - ego_target_xy[:, -1:, :], dim=-1
+            )
+            print(f"[DIAG] min endpoint dist: {endpoint_dist.min(dim=-1)[0].mean().item():.3f}  ← should be <3")
+            print(f"[DIAG] mean endpoint dist: {endpoint_dist.mean().item():.3f}")
+
+            pred_xy = res["prediction"][..., :2]
+            pred_target_xy = pred_target[..., :2]
+            valid = data["agent"]["valid_mask"][:, 1:, self.history_steps:]
+            pred_dist = torch.norm(pred_xy - pred_target_xy, dim=-1)
+            pred_dist_valid = (pred_dist * valid).sum() / (valid.sum() + 1e-6)
+            print(f"[DIAG] mean pred displacement: {pred_dist_valid.item():.3f}  ← should be <3")
+
+
         outputs = {
             "trajectory": top_k_traj[..., :2],
             "probability": top_k_prob,
