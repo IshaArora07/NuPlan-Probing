@@ -51,7 +51,7 @@ class PlanningModel(TorchModuleWrapper):
         feature_builder: PlutoFeatureBuilder = PlutoFeatureBuilder(),
 
         # -------- EMoE --------
-        num_scene_types: int = 2,     # YOU CURRENTLY USE 2
+        num_scene_types: int = 6,     
         interaction_pred_output_dim_per_step: int = 2,
     ) -> None:
         super().__init__(
@@ -105,7 +105,9 @@ class PlanningModel(TorchModuleWrapper):
             use_token_pooling=True,
         )
 
-        anchors_xy_init = torch.zeros(num_scene_types, num_modes, 2)
+        scene_anchors_path = "......"
+        anchors = np.load(scene_anchors_path)
+        anchors_xy_init = torch.from_numpy(anchors).float()
         self.mode_query_generator = SceneModeQueryGeneratorHard(
             anchors_xy=anchors_xy_init,
             d_model=dim,
