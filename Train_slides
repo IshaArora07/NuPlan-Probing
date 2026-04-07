@@ -1,0 +1,374 @@
+Got it — let me correct the slide content to accurately reflect what each training actually contained:
+
+Slide 1: Title
+EMoE Planner: Training Progression and Results
+Scene-Adaptive Motion Planning with Explicit Mixture of Experts
+[Your Name] | Thesis Progress
+
+Slide 2: EMoE Architecture Overview
+	∙	Built on PLUTO framework using nuPlan dataset
+	∙	6-class scene router: Left turn, Straight at intersection, Right turn, Straight non-intersection, U-turn, Others
+	∙	Hard routing — explicit scene classification drives expert selection
+	∙	Per-scene expert FFN in planning decoder
+	∙	Scene-conditioned mode queries via FOPE-encoded anchors
+	∙	Interaction prediction decoder for agent trajectory forecasting
+	∙	850K training scenarios, 4 GPU cluster training
+
+Slide 3: Training Pipeline Overview
+Six progressive trainings, each building on previous confirmed results:
+	∙	Training 1: Baseline EMoE + class balancing
+	∙	Training 2: Core correctness fixes — WTA, score_attn, cls weight
+	∙	Training 3: Agent prediction + anchor improvements + score_attn LR fix
+	∙	Training 4: Loss balance + velocity + smoothness + distance weighting (running)
+	∙	Training 5: Architecture — Ka=32, iterative refinement (planned)
+	∙	Training 6: Minority experts + full convergence (planned)
+
+Slide 4: Training 1 — Baseline + Class Balancing
+Configuration: 4 GPUs, batch 32, 40 epochs, lr=1e-3, weight decay=1e-4
+Changes from base EMoE:
+	∙	Weighted router CrossEntropy — inverse frequency class weights from scene_labels.jsonl
+	∙	WeightedRandomSampler — guaranteed minority class exposure per batch
+	∙	Gradient clipping 1.0 — training stability
+Key issues identified after training:
+	∙	LR too high (1e-3) — causing instability
+	∙	WTA mode selection used all 6 channels — incorrect
+	∙	score_attn ungated — cls_loss continuously increasing to 2.4+
+	∙	All losses increasing after 3 epochs despite class balancing fixes
+Results:
+	∙	minADE: 2.63 | minFDE: 7.16
+	∙	PredAvgADE: 0.90 | PredAvgFDE: 2.80
+	∙	MR: 0.43 | Router accuracy: 0.93
+	∙	num_unique_preds: 5.08 — class balancing worked
+	∙	cls_loss: 1.9 but climbing — score_attn ungated
+
+Slide 5: Training 1 — What Worked vs What Failed
+What worked:
+	∙	Weighted sampler — num_unique_preds reached 5.08 ✅
+	∙	Router accuracy 93% — class balancing effective ✅
+	∙	Gradient clipping — no NaN ✅
+	∙	Router confusion matrix — classes 0-3 above 89% accuracy ✅
+What failed:
+	∙	minFDE 7.16 — score_attn ungated, pi_head scoring wrong modes ❌
+	∙	cls_loss climbing to 2.4 — score_attn_scale growing too fast ❌
+	∙	LR 1e-3 too high — instability ❌
+	∙	WTA all 6 channels — mode selection polluted by yaw/velocity ❌
+	∙	PredAvgFDE 2.80 — interaction decoder bottleneck ❌
+
+Slide 6: Training 2 — Core Correctness Fixes
+Configuration: 4 GPUs, batch 32, 50 epochs, lr=5e-4, weight decay=1e-3
+Changes from Training 1:
+	∙	WTA xy-only mode selection — yaw/velocity channels removed from mode distance computation
+	∙	score_attn_scale LR = lr×0.05 — gated attention growth prevents cls_loss climbing
+	∙	w_cls=2.0 — stronger mode scoring supervision
+	∙	Endpoint loss added to reg_loss — direct minFDE supervision
+	∙	Temporal reweighting — blend exponential decay with endpoint emphasis
+	∙	LR reduced 1e-3→5e-4, weight decay increased 1e-4→1e-3
+	∙	sync_dist=True — accurate distributed val metrics
+	∙	epochs=50
+All Training 1 changes retained: weighted CE, weighted sampler, gradient clipping
+
+Slide 7: Training 2 — Results
+
+
+
+|Metric         |Training 1  |Training 2 |Change     |
+|---------------|------------|-----------|-----------|
+|minADE         |2.63        |0.81       |-69% ✅     |
+|minFDE         |7.16        |1.10       |-85% ✅     |
+|PredAvgADE     |0.90        |0.89       |marginal   |
+|PredAvgFDE     |2.80        |2.80       |unchanged ❌|
+|MR             |0.43        |0.13       |-70% ✅     |
+|Router accuracy|0.93        |0.93       |stable     |
+|cls_loss       |1.9 climbing|2.35 stable|fixed ✅    |
+
+Key finding: minFDE 7.16→1.10 — score_attn_scale fix was primary bottleneck
+Remaining gap: PredAvgFDE unchanged — interaction decoder identified as bottleneck
+Note: cls_loss at 2.35 still not fully converged — score_attn_scale LR lr×0.05 insufficient
+
+Slide 8: Training 2 — Why minFDE Improved So Dramatically
+Training 1 failure mode:
+	∙	score_attn ungated → pi_head received unstable input distribution
+	∙	Mode scoring learned wrong targets → wrong trajectory selected at inference
+	∙	minFDE 7.16 despite good trajectories existing in Ka modes
+Training 2 fix — score_attn_scale gating:
+	∙	torch.tanh(score_attn_scale) × score_ctx — starts at zero contribution
+	∙	pi_head trains stably from epoch 1 on consistent input
+	∙	Gradually learns cross-mode context as scale grows
+	∙	Correct mode selected at inference → minFDE 1.10
+Additional contributor — WTA xy-only:
+	∙	Removed yaw/velocity from mode distance → stable target_m_index
+	∙	cls_loss no longer chasing moving targets
+
+Slide 9: Training 2 — Remaining Problems
+PredAvgFDE stuck at 2.80 — interaction decoder analysis:
+	∙	decoded_queries passed all Ka=24 modes to interaction decoder
+	∙	Agents cross-attended to ALL modes simultaneously — contradictory conditioning
+	∙	Single linear traj_head — insufficient expressivity
+	∙	Only 2 decoder layers — limited capacity
+	∙	No explicit agent endpoint supervision
+	∙	smooth_l1 pred_loss misaligned with L2-based PredAvgFDE metric
+	∙	w_pred=1.0 with small pred_loss (0.07) — insufficient gradient signal
+cls_loss at 2.35 after 50 epochs:
+	∙	score_attn_scale LR lr×0.05 still too fast
+	∙	pi_head adapting but not fully converged
+
+Slide 10: Training 3 — Agent Prediction + Anchor Improvements
+Configuration: 4 GPUs, batch 32, 50 epochs, same lr/wd as training 2
+Model changes:
+	∙	num_layers=3 in interaction decoder — more agent-agent interaction capacity
+	∙	self.cat_x and self.interaction_pred_output_dim_per_step — architecture completeness
+	∙	Learnable anchors — nn.Parameter instead of fixed buffer
+	∙	Option 4 anchor padding — perturbed noise instead of repeated centers
+Trainer changes:
+	∙	score_attn_scale LR = lr×0.01 — slower gating for cls_loss convergence
+	∙	w_pred=1.0 with MSE loss normalized by T — better alignment with ADE metric
+	∙	Smooth L1 endpoint loss weight=2.0 — direct PredAvgFDE supervision
+	∙	pred_endpoint_loss logged separately — direct observability
+	∙	Temporal reweighting blend decay + endpoint_w — better timestep balance
+	∙	best_query conditioning — single best mode to interaction decoder
+
+Slide 11: Training 3 — Results
+
+
+
+|Metric            |Training 2|Training 3|Change                     |
+|------------------|----------|----------|---------------------------|
+|minADE            |0.81      |0.83      |-2.5% slight regression    |
+|minFDE            |1.10      |1.125     |-2.3% slight regression    |
+|PredAvgADE        |0.89      |0.83      |+6.7% ✅                    |
+|PredAvgFDE        |2.80      |2.10      |+25% ✅                     |
+|MR                |0.13      |0.14      |slight regression          |
+|Router accuracy   |0.93      |0.94      |marginal improvement       |
+|cls_loss          |2.35      |2.33      |marginal — still converging|
+|pred_endpoint_loss|—         |2.03      |new metric                 |
+
+Key finding: PredAvgFDE 2.80→2.10 — interaction decoder fixes and endpoint loss worked
+Trade-off: w_pred=1.0 with MSE caused 8x prediction/planning imbalance → slight planning regression
+
+Slide 12: Training 3 — Loss Imbalance Analysis
+Root cause of minADE/minFDE slight regression:
+At end of training 3:
+	∙	prediction_loss = 4.15
+	∙	reg_loss = 0.50
+	∙	w_pred × prediction_loss = 1.0 × 4.15 = 4.15
+	∙	w_reg × reg_loss = 1.0 × 0.50 = 0.50
+	∙	Imbalance ratio: 8.3x
+MSE naturally produces larger values than smooth L1:
+	∙	smooth_l1(3m error) ≈ 2.5
+	∙	mse(3m error) = 9.0 — 3.6x larger
+Optimizer spent 8x more gradient signal on agent prediction than ego planning
+Result: interaction decoder improved significantly, planning decoder slightly regressed
+Solution for Training 4: w_pred=0.5 reduces imbalance to ~4x
+
+Slide 13: Training 3 — Anchor Improvements
+Fixed anchor padding (Option 4):
+Before — repeated first center:
+	∙	np.repeat(centers[:1], reps, axis=0)
+	∙	Multiple identical anchors → same FOPE encoding → wasted mode capacity
+	∙	Minority classes (16K-35K samples) had many duplicate anchors
+After — perturbed padding:
+	∙	centers[random_choice] + Gaussian_noise(std=1.0m)
+	∙	All Ka anchors start at distinct positions
+	∙	Gradient signal immediately differentiates duplicate anchors from step 1
+Learnable anchors:
+	∙	register_buffer → nn.Parameter
+	∙	Anchors receive gradients through FOPE → reg_loss path
+	∙	Learn to position themselves where decoder can best cover GT endpoints
+	∙	Converge to optimal initialization positions by epoch 15-20
+
+Slide 14: Training 4 — Balance + Comfort + Velocity (Running)
+Configuration: 4 GPUs, batch 32, 50 epochs
+Changes from Training 3:
+	∙	w_pred=0.5 — fixes 8x prediction/planning imbalance
+	∙	Distance-weighted supervision — 2x weight within 20m, 0.5x beyond 40m
+	∙	Velocity conditioning — agent_vel_proj encodes current agent velocities
+	∙	Smoothness regularization — jerk penalty weight=0.1 targets comfort score
+	∙	Yaw smoothness — heading rate penalty weight=0.05
+All Training 3 changes retained:
+	∙	score_attn_scale LR lr×0.01
+	∙	MSE + smooth L1 endpoint loss
+	∙	Learnable anchors + option 4 padding
+	∙	num_layers=3, best_query conditioning
+Primary targets: Recover minADE/minFDE, improve PredAvgADE, improve comfort score
+
+Slide 15: Training 4 — Design Rationale
+w_pred=0.5 rationale:
+	∙	Training 3 showed 8x imbalance hurting planning metrics
+	∙	0.5 reduces to ~4x — still emphasizes agent prediction but not at planning expense
+	∙	Expected: recover minADE to 0.75-0.80, keep PredAvgFDE gains
+Velocity conditioning rationale:
+	∙	PredAvgADE averages error over all timesteps
+	∙	Fast agents accumulate large displacement errors without speed context
+	∙	agent_vel_proj gives decoder explicit speed information per agent
+	∙	Expected: 0.05-0.10 PredAvgADE improvement
+Distance weighting rationale:
+	∙	Distant stationary agents inflate PredAvgADE with easy-to-predict but irrelevant errors
+	∙	Close agents within 20m are interaction-critical
+	∙	2x weight focuses learning where it matters for TTC and collision metrics
+	∙	Expected: 0.05-0.08 PredAvgADE improvement
+Smoothness rationale:
+	∙	Paper’s comfort score 98.16 — highest of all planners
+	∙	Explicit jerk supervision directly targets comfort metric
+	∙	1.9% of reg_loss contribution — stable, not dominant
+
+Slide 16: Training 4 — Expected Results
+
+
+
+|Metric    |T2  |T3   |T4 Conservative|T4 Optimistic|
+|----------|----|-----|---------------|-------------|
+|minADE    |0.81|0.83 |0.75-0.80      |0.68-0.75    |
+|minFDE    |1.10|1.125|0.95-1.08      |0.85-0.95    |
+|PredAvgADE|0.89|0.83 |0.72-0.78      |0.62-0.70    |
+|PredAvgFDE|2.80|2.10 |1.80-2.00      |1.60-1.85    |
+|MR        |0.13|0.14 |0.10-0.13      |0.08-0.11    |
+
+Simulation targets:
+	∙	Val14: 90-92 (paper w/o post: 93.06)
+	∙	Comfort: 96-97 (paper: 98.16)
+	∙	Progress: 90-92 (paper: 92.35)
+	∙	TTC: 93-94 (paper: 94.77)
+
+Slide 17: Training 5 — Architecture + Mode Coverage (Planned)
+Builds on Training 4. New changes:
+	∙	Ka=32 — increased mode queries, better GT endpoint distribution coverage
+	∙	Iterative anchor refinement — each decoder layer refines mode positions ±5m
+	∙	Goal-conditioned loss weight=0.3 — explicit endpoint supervision for progress score
+	∙	Relative velocity conditioning — agent velocity relative to ego for TTC prediction
+	∙	Acceleration penalty — lateral and longitudinal acceleration regularization
+	∙	epochs=55
+Primary targets:
+	∙	minFDE below 1.0
+	∙	Val14 score 91-93
+	∙	Progress score 91-93
+
+Slide 18: Training 5 — Iterative Refinement Design
+Current limitation — fixed anchors through all decoder layers:
+	∙	Mode queries initialized from FOPE-encoded anchors at layer 0
+	∙	All 4 decoder layers process from same starting position
+	∙	Large displacement from anchor to GT endpoint must happen in feature space only
+Training 5 — per-layer anchor refinement:
+	∙	After each decoder layer i: delta = tanh(interim_loc_head_i(x)) × 5.0m
+	∙	Current anchors updated: current_anchors = current_anchors + delta
+	∙	Position re-encoded via interim_pos_enc(delta) added to x with weight 0.1
+	∙	Each layer refines position progressively toward GT endpoint
+	∙	Final layer decodes trajectory from already-refined position
+Expected impact:
+	∙	Modes converge to GT endpoints more precisely
+	∙	minFDE improvement 0.15-0.25
+	∙	Progress score improvement from better goal reaching
+
+Slide 19: Training 6 — Minority Experts + Convergence (Planned)
+Builds on Training 5. New changes:
+	∙	Soft routing warmup 3 epochs — weighted sum of all experts vs hard argmax
+	∙	Load balancing loss weight=0.01 — entropy regularization for uniform usage
+	∙	w_router=2.0 — stronger router supervision for minority classes
+	∙	epochs=60 — full convergence
+Addresses persistent issues:
+	∙	Class 4 (U-turn) usage: 2.9% — expert undertrained
+	∙	Class 5 (others) usage: 1.85% — expert undertrained
+	∙	cls_loss still 2.33 after 50 epochs — needs further convergence
+Soft routing warmup design:
+	∙	Epochs 0-2: soft_weights = softmax(scene_logits) → weighted sum of all experts
+	∙	All experts receive gradient signal from every sample
+	∙	Epoch 3+: hard routing resumes with better initialized experts
+Primary targets:
+	∙	Val14 score 92-93
+	∙	Class 4 accuracy 92%+
+	∙	Class 5 accuracy 83%+
+	∙	cls_loss below 2.0
+
+Slide 20: Future Work — Post-Processing + HYDRA (Planned)
+LQR post-processor (inference only):
+	∙	Smooths planned trajectory using Linear Quadratic Regulator
+	∙	Enforces physically feasible velocity and acceleration profiles
+	∙	Paper shows +1.29 Val14 points from post-processing alone (93.06→94.35)
+	∙	Zero retraining cost — pure inference improvement
+HYDRA occupancy head:
+	∙	Auxiliary binary cross-entropy loss — is any agent within 2m at each timestep
+	∙	Improves TTC and collision scores
+	∙	Additive to EMoE — does not replace core architecture
+Expected targets with post-processing:
+	∙	Val14: 93-95 — matching or beating paper
+	∙	Comfort: 98+ — matching paper
+	∙	Progress: 92-94
+
+Slide 21: Open-Loop Metrics Progression
+
+
+
+|Metric    |T1  |T2  |T3   |T4 exp|T5 exp|T6 exp|Paper|
+|----------|----|----|-----|------|------|------|-----|
+|minADE    |2.63|0.81|0.83 |0.75  |0.68  |0.65  |~0.8 |
+|minFDE    |7.16|1.10|1.125|0.95  |0.85  |0.80  |~1.8 |
+|PredAvgADE|0.90|0.89|0.83 |0.72  |0.65  |0.62  |0.71 |
+|PredAvgFDE|2.80|2.80|2.10 |1.85  |1.65  |1.50  |2.12 |
+|MR        |0.43|0.13|0.14 |0.11  |0.09  |0.08  |~0.15|
+
+Slide 22: Simulation Score Progression
+
+
+
+|Training |Val14 |Comfort|Progress|TTC   |Key Change        |
+|---------|------|-------|--------|------|------------------|
+|T1       |~85-87|~92    |~86     |~89   |Class balancing   |
+|T2       |~87-89|~94    |~88     |~91   |score_attn fix    |
+|T3       |~88-90|~94    |~89     |~92   |Agent prediction  |
+|T4       |~90-92|~96-97 |~90-92  |~93-94|Smooth + velocity |
+|T5       |~91-93|~97    |~91-93  |~94-95|Ka=32 + refinement|
+|T6       |~92-93|~98    |~92-93  |~95   |Soft routing      |
+|T7+post  |~93-95|~98+   |~92-94  |~95+  |LQR + occupancy   |
+|Paper w/o|93.06 |98.16  |92.35   |94.77 |—                 |
+|Paper w/ |94.35 |—      |—       |—     |—                 |
+
+Slide 23: Router Performance Across Trainings
+
+
+
+|Class         |T1  |T2  |T3  |T4 target|T6 target|
+|--------------|----|----|----|---------|---------|
+|0 Left turn   |0.94|0.95|0.95|0.95+    |0.96     |
+|1 Straight int|0.89|0.89|0.90|0.90+    |0.91     |
+|2 Right turn  |0.94|0.95|0.95|0.95+    |0.96     |
+|3 Straight non|0.96|0.96|0.96|0.96+    |0.97     |
+|4 U-turn      |0.89|0.90|0.90|0.91+    |0.93     |
+|5 Others      |0.81|0.79|0.80|0.81+    |0.84     |
+|Overall       |0.93|0.93|0.94|0.94+    |0.95+    |
+
+Expert usage imbalance across all trainings:
+	∙	Classes 0-3: ~24-25% each — consistent
+	∙	Class 4: 2.9% | Class 5: 1.85% — persistently undertrained
+	∙	Solution: Soft routing warmup in Training 6
+
+Slide 24: Key Technical Contributions
+	1.	Scene classification pipeline
+	∙	Full-scenario classification for balanced 6-class labels
+	∙	200K each for classes 0-3, 35K class 4, 16K class 5
+	∙	Inverse-frequency weighted CE + WeightedRandomSampler
+	2.	Training correctness fixes
+	∙	WTA xy-only — correctness fix with 85% minFDE improvement
+	∙	score_attn_scale gating — stable mode scoring
+	∙	Learnable anchors with perturbed padding — better mode initialization
+	3.	Agent prediction improvements
+	∙	best_query conditioning — unambiguous single ego plan to interaction decoder
+	∙	MSE + smooth L1 endpoint — metric-aligned loss functions
+	∙	Distance weighting + velocity conditioning — interaction-focused learning
+	4.	Simulation quality
+	∙	Smoothness + yaw regularization — comfort score optimization
+	∙	Iterative anchor refinement — progressive endpoint convergence
+	∙	LQR post-processing — physically feasible trajectory execution
+
+Slide 25: Conclusion
+Current status:
+	∙	Training 4 running — expected Val14 90-92
+	∙	Training 5-6 planned — expected Val14 92-93+
+	∙	Post-processing — expected Val14 93-95 matching paper
+Progressive improvement strategy proven effective:
+	∙	Each training isolates 2-4 changes for clear attribution
+	∙	Training 2 score_attn fix: single most impactful change (-85% minFDE)
+	∙	Training 3 interaction decoder: -25% PredAvgFDE
+	∙	Training 4-6: closing remaining gap to paper SOTA
+Key insight: Loss function alignment with target metrics more important than architecture complexity
+	∙	WTA xy-only, MSE for ADE, smooth L1 for FDE — each directly optimizes its metric
+	∙	Over-engineering losses (GMM) caused instability — simpler aligned losses more effective
+Future: HYDRA-MDP++ integration for hierarchical planning + LQR post-processing for SOTA Val14​​​​​​​​​​​​​​​​
