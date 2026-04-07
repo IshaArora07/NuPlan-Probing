@@ -1,10 +1,3 @@
-Those triple backticks make the script **invalid bash immediately**.
-
-Below is the **fully corrected final version**, including your new **RENDER override support**.
-
----
-
-```bash
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -24,13 +17,6 @@ LOCAL_TEST="${LOCAL_TEST:-false}"
 SCENARIO_BUILDER="${SCENARIO_BUILDER:-nuplan}"
 SCENARIO_FILTER="${SCENARIO_FILTER:-val14_benchmark}"
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-emoe_simulation}"
-RENDER="${RENDER:-false}"
-VIDEO_SAVE_DIR="${VIDEO_SAVE_DIR:-/tmp/dummy}"
-
-# ── Local test params ──────────────────────────────────────
-LOCAL_TEST_SCENARIO_BUILDER="${LOCAL_TEST_SCENARIO_BUILDER:-nuplan_mini}"
-LOCAL_TEST_SCENARIO_FILTER="${LOCAL_TEST_SCENARIO_FILTER:-mini_demo_scenario}"
-LOCAL_TEST_S3_DB_PATH="${LOCAL_TEST_S3_DB_PATH:-${S3_DATA_ROOT}/nuplan-v1.1/mini}"
 
 # ── Full run DB path ───────────────────────────────────────
 FULL_S3_DB_PATH="${FULL_S3_DB_PATH:-${S3_DATA_ROOT}/nuplan-v1.1/trainval}"
@@ -58,24 +44,36 @@ echo "[INFO] NUPLAN_DATA_ROOT = ${NUPLAN_DATA_ROOT}"
 echo "[INFO] NUPLAN_EXP_ROOT  = ${NUPLAN_EXP_ROOT}"
 
 # ── Sync DB files ──────────────────────────────────────────
+DB_LOCAL_PATH="${LOCAL_CACHE_ROOT}/nuplan-v1.1/trainval"
+mkdir -p "${DB_LOCAL_PATH}"
+
 if [ "${LOCAL_TEST}" = "true" ]; then
-    echo "[INFO] LOCAL_TEST=true — syncing mini dataset..."
+    echo "[INFO] LOCAL_TEST=true — syncing 2 trainval DB files only..."
 
-    DB_LOCAL_PATH="${LOCAL_CACHE_ROOT}/nuplan-v1.1/mini"
-    mkdir -p "${DB_LOCAL_PATH}"
+    DB_FILES=$(
+        aws s3 ls "${FULL_S3_DB_PATH}/" \
+        | awk '{print $NF}' \
+        | grep '\.db$' \
+        | head -2 || true
+    )
 
-    aws s3 sync \
-        "${LOCAL_TEST_S3_DB_PATH}" \
-        "${DB_LOCAL_PATH}" \
-        --only-show-errors
+    if [ -z "${DB_FILES}" ]; then
+        echo "[ERROR] No .db files found in ${FULL_S3_DB_PATH}"
+        exit 1
+    fi
 
-    ACTIVE_SCENARIO_BUILDER="${LOCAL_TEST_SCENARIO_BUILDER}"
-    ACTIVE_SCENARIO_FILTER="${LOCAL_TEST_SCENARIO_FILTER}"
+    for DB_FILE in ${DB_FILES}; do
+        echo "[INFO] Syncing ${DB_FILE}..."
+        aws s3 cp \
+            "${FULL_S3_DB_PATH}/${DB_FILE}" \
+            "${DB_LOCAL_PATH}/${DB_FILE}" \
+            --only-show-errors
+    done
+
+    ACTIVE_SCENARIO_BUILDER="${SCENARIO_BUILDER}"
+    ACTIVE_SCENARIO_FILTER="mini_demo_scenario"
 else
     echo "[INFO] Syncing full val DB split..."
-
-    DB_LOCAL_PATH="${LOCAL_CACHE_ROOT}/nuplan-v1.1/trainval"
-    mkdir -p "${DB_LOCAL_PATH}"
 
     aws s3 sync \
         "${FULL_S3_DB_PATH}" \
@@ -104,7 +102,8 @@ export NUPLAN_MAP_VERSION="nuplan-maps-v1.0"
 
 echo "[INFO] NUPLAN_DB_FILES    = ${NUPLAN_DB_FILES}"
 echo "[INFO] NUPLAN_MAP_VERSION = ${NUPLAN_MAP_VERSION}"
-echo "[INFO] RENDER             = ${RENDER}"
+echo "[INFO] SCENARIO_BUILDER   = ${ACTIVE_SCENARIO_BUILDER}"
+echo "[INFO] SCENARIO_FILTER    = ${ACTIVE_SCENARIO_FILTER}"
 
 # ── Download checkpoint from S3 ────────────────────────────
 CHECKPOINT_FILENAME="$(basename "${S3_CHECKPOINT_PATH}")"
@@ -133,8 +132,7 @@ sh ./script/run_pluto_planner.sh \
     "${ACTIVE_SCENARIO_BUILDER}" \
     "${ACTIVE_SCENARIO_FILTER}" \
     "${CHECKPOINT_FILENAME}" \
-    "${VIDEO_SAVE_DIR}" \
-    "planner.pluto_planner.render=${RENDER}"
+    /tmp/dummy
 
 echo "[INFO] Simulation completed."
 
