@@ -1,32 +1,36 @@
 import pandas as pd
+import numpy as np
 
 df = pd.read_parquet('your_file.parquet')
 
-# Remove final_score row for cleaner analysis
-df_scenarios = df[df['scenario_type'] != 'final_score']
+# Remove final_score row
+df = df[df['scenario_type'] != 'final_score'].copy()
 
-# Print exactly these columns in this order
-cols = [
-    'scenario_type',
+# Convert numeric columns properly
+numeric_cols = [
     'score',
     'ego_is_comfortable',
-    'no_ego_at_fault_collisions', 
+    'no_ego_at_fault_collisions',
     'time_to_collision_within_bound',
     'drivable_area_compliance',
     'ego_is_making_progress',
     'speed_limit_compliance',
 ]
 
-# Check which exist
-existing = [c for c in cols if c in df.columns]
-print("Available:", existing)
+# Force convert to numeric
+for col in numeric_cols:
+    if col in df.columns:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
 
-summary = df_scenarios.groupby('scenario_type')[existing].mean().round(3)
-summary['count'] = df_scenarios.groupby('scenario_type').size()
+# Only keep existing columns
+existing = [c for c in numeric_cols if c in df.columns]
+
+# Group and aggregate
+summary = df.groupby('scenario_type')[existing].mean().round(3)
+summary.insert(0, 'count', df.groupby('scenario_type').size())
 summary = summary.sort_values('score')
 
-# Save to CSV for clean reading
-summary.to_csv('t4_scenario_breakdown.csv')
-print(summary[['count', 'score', 'ego_is_comfortable', 
-               'no_ego_at_fault_collisions',
-               'time_to_collision_within_bound']].to_string())
+# Save to CSV
+summary.to_csv('t4_breakdown.csv')
+print(summary.to_string())
+print(f"\nOverall score: {df['score'].mean():.4f}")
