@@ -2,22 +2,13 @@
 """
 Analysis script for scene_labels.jsonl produced by the EMoE precompute pipeline.
 
-Analyses performed:
-
-1. Class Distribution         — scenario counts per EMoE class
-1. Tag vs Class Confusion     — nuPlan scenario_type  x  emoe_class_id heatmap
-1. Stage Distribution         — which classifier stage fired, per class
-1. Travel Distance            — boxplot of travel_distance_m per class
-1. “Others” Deep-Dive         — scenario_type breakdown + stage breakdown for class 6
-1. Debug Signal Distributions — abs_delta_heading_deg, total_abs_heading_deg,
-   path_len_over_dist per class (violin / histogram)
-
-Usage:
-python analyze_scene_labels.py \
-  --labels_path ./emoe_precomputed/scene_labels.jsonl \
-  --output_dir  ./analysis_plots
-
-All plots are saved as PNG to --output_dir. A summary table is printed to stdout.
+Generates:
+1. Class Distribution
+2. Tag vs Class Confusion Matrix
+3. Stage Distribution
+4. Travel Distance Distribution
+5. "Others" Deep-Dive
+6. Debug Signal Distributions
 """
 
 import json
@@ -34,18 +25,14 @@ import matplotlib.ticker as mticker
 from matplotlib.colors import LinearSegmentedColormap
 import matplotlib.patches as mpatches
 
-# ──────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────
 # Constants
-# ──────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
 
 EMOE_SCENE_TYPES = [
-    "left_turn",
-    "straight_inter",
-    "right_turn",
-    "straight_non",
-    "roundabout",
-    "u_turn",
-    "others",
+    "left_turn", "straight_inter", "right_turn",
+    "straight_non", "roundabout", "u_turn", "others"
 ]
 
 EMOE_FULL_NAMES = [
@@ -65,18 +52,19 @@ CLASS_COLORS = [
     "#8172B2", "#CCB974", "#64B5CD", "#A9A9A9",
 ]
 
-# ──────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────
 # Helpers
-# ──────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
 
 def load_records(labels_path: Path):
     records = []
     with labels_path.open("r") as f:
         for line in f:
-            line = line.strip()
-            if line:
+            if line.strip():
                 records.append(json.loads(line))
     return records
+
 
 def savefig(fig, out_dir: Path, name: str):
     path = out_dir / name
@@ -84,153 +72,185 @@ def savefig(fig, out_dir: Path, name: str):
     plt.close(fig)
     print(f"  Saved → {path}")
 
+
 def style_ax(ax, title, xlabel=None, ylabel=None):
-    ax.set_title(title, fontsize=13, fontweight="bold", pad=10)
+    ax.set_title(title, fontsize=13, fontweight="bold")
     if xlabel:
-        ax.set_xlabel(xlabel, fontsize=10)
+        ax.set_xlabel(xlabel)
     if ylabel:
-        ax.set_ylabel(ylabel, fontsize=10)
+        ax.set_ylabel(ylabel)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
-    ax.tick_params(labelsize=9)
 
-# ──────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────
 # 1. Class Distribution
-# ──────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
 
 def plot_class_distribution(records, out_dir):
-    print("[1] Class distribution...")
     counts = Counter(r["emoe_class_id"] for r in records)
     total = len(records)
 
-    ids = list(range(N_CLASSES))
-    vals = [counts.get(i, 0) for i in ids]
-    labels = [f"[{i}] {EMOE_SCENE_TYPES[i]}" for i in ids]
-    pcts = [100.0 * v / max(1, total) for v in vals]
+    vals = [counts.get(i, 0) for i in range(N_CLASSES)]
+    labels = [f"[{i}] {EMOE_SCENE_TYPES[i]}" for i in range(N_CLASSES)]
 
     fig, ax = plt.subplots(figsize=(10, 5))
-    bars = ax.bar(labels, vals, color=CLASS_COLORS, edgecolor="white", linewidth=0.8)
+    ax.bar(labels, vals, color=CLASS_COLORS)
 
-    for bar, pct in zip(bars, pcts):
-        ax.text(bar.get_x() + bar.get_width() / 2,
-                bar.get_height() + total * 0.003,
-                f"{pct:.1f}%", ha="center", va="bottom", fontsize=9)
-
-    style_ax(ax, "EMoE Class Distribution", ylabel="Scenario Count")
-    ax.set_xticks(range(N_CLASSES))
-    ax.set_xticklabels(labels, rotation=25, ha="right")
-    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"{int(x):,}"))
-
-    fig.tight_layout()
+    style_ax(ax, "Class Distribution", ylabel="Count")
     savefig(fig, out_dir, "1_class_distribution.png")
 
-# ──────────────────────────────────────────────────────────────
-# 6. Debug Signals (only section shown shortened fix context)
-# ──────────────────────────────────────────────────────────────
 
-def plot_debug_signals(records, out_dir):
-    print("\n[6] Debug signal distributions per class...")
+# ─────────────────────────────────────────────
+# 2. Confusion Matrix
+# ─────────────────────────────────────────────
 
-    signals = {
-        "abs_delta_heading_deg": "Abs Net Heading Change (°)",
-        "total_abs_heading_deg": "Total Abs Heading (°)",
-        "path_len_over_dist":    "Path Length / Straight Dist (loopiness)",
-    }
+def plot_confusion_matrix(records, out_dir, top_n_tags=25):
+    pair_counts = Counter()
+    tag_totals = Counter()
 
-    data: Dict = {sig: defaultdict(list) for sig in signals}
+    for r in records:
+        tag = str(r.get("scenario_type", "unknown"))
+        cls = int(r["emoe_class_id"])
+        pair_counts[(tag, cls)] += 1
+        tag_totals[tag] += 1
+
+    top_tags = [t for t, _ in tag_totals.most_common(top_n_tags)]
+
+    matrix = np.zeros((len(top_tags), N_CLASSES))
+
+    for i, tag in enumerate(top_tags):
+        for j in range(N_CLASSES):
+            matrix[i, j] = pair_counts.get((tag, j), 0)
+
+    matrix = matrix / np.maximum(matrix.sum(axis=1, keepdims=True), 1)
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    im = ax.imshow(matrix, cmap="Blues")
+
+    ax.set_xticks(range(N_CLASSES))
+    ax.set_yticks(range(len(top_tags)))
+    ax.set_yticklabels(top_tags)
+
+    style_ax(ax, "Tag vs Class Confusion")
+
+    fig.colorbar(im)
+    savefig(fig, out_dir, "2_confusion.png")
+
+
+# ─────────────────────────────────────────────
+# 3. Stage Distribution
+# ─────────────────────────────────────────────
+
+def plot_stage_distribution(records, out_dir):
+    class_stage = defaultdict(Counter)
 
     for r in records:
         cls = int(r["emoe_class_id"])
-        debug = r.get("debug", {}) or {}
+        stage = r.get("stage", "unknown")
+        class_stage[cls][stage] += 1
 
-        for sig in signals:
-            val = debug.get(sig, None)
+    stages = list({s for c in class_stage.values() for s in c})
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    bottoms = np.zeros(N_CLASSES)
+
+    for s in stages:
+        vals = [class_stage[i].get(s, 0) for i in range(N_CLASSES)]
+        ax.bar(range(N_CLASSES), vals, bottom=bottoms, label=s)
+        bottoms += vals
+
+    ax.legend(fontsize=6)
+    style_ax(ax, "Stage Distribution")
+    savefig(fig, out_dir, "3_stage.png")
+
+
+# ─────────────────────────────────────────────
+# 4. Travel Distance
+# ─────────────────────────────────────────────
+
+def plot_travel_distance(records, out_dir):
+    data = defaultdict(list)
+
+    for r in records:
+        if "travel_distance_m" in r:
+            data[r["emoe_class_id"]].append(r["travel_distance_m"])
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.boxplot([data[i] for i in range(N_CLASSES)])
+
+    style_ax(ax, "Travel Distance", ylabel="Meters")
+    savefig(fig, out_dir, "4_travel_distance.png")
+
+
+# ─────────────────────────────────────────────
+# 5. Others Deep Dive
+# ─────────────────────────────────────────────
+
+def plot_others_deepdive(records, out_dir):
+    others = [r for r in records if r["emoe_class_id"] == 6]
+
+    tags = Counter(r.get("scenario_type", "unknown") for r in others)
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    items = tags.most_common(15)
+
+    ax.barh([i[0] for i in items], [i[1] for i in items])
+
+    style_ax(ax, "Others Breakdown")
+    savefig(fig, out_dir, "5_others.png")
+
+
+# ─────────────────────────────────────────────
+# 6. Debug Signals
+# ─────────────────────────────────────────────
+
+def plot_debug_signals(records, out_dir):
+    signals = ["abs_delta_heading_deg", "total_abs_heading_deg"]
+
+    fig, axes = plt.subplots(1, len(signals), figsize=(12, 5))
+
+    for i, sig in enumerate(signals):
+        data = defaultdict(list)
+
+        for r in records:
+            val = r.get("debug", {}).get(sig)
             if val is not None:
-                try:
-                    data[sig][cls].append(float(val))
-                except (TypeError, ValueError):
-                    pass
+                data[r["emoe_class_id"]].append(val)
 
-    fig, axes = plt.subplots(1, len(signals), figsize=(18, 6))
+        axes[i].boxplot([data[j] for j in range(N_CLASSES)])
+        axes[i].set_title(sig)
 
-    for ax, (sig, ylabel) in zip(axes, signals.items()):
-        class_data = [data[sig].get(i, []) for i in range(N_CLASSES)]
+    savefig(fig, out_dir, "6_debug.png")
 
-        all_vals = [v for d in class_data for v in d]
-        if not all_vals:
-            ax.set_title(ylabel)
-            continue
 
-        p95 = float(np.percentile(all_vals, 95))
-
-        vp = ax.violinplot(
-            [np.clip(d, 0, p95 * 1.5) if d else [0] for d in class_data],
-            positions=range(N_CLASSES),
-            showmedians=True,
-            showextrema=False,
-            widths=0.7,
-        )
-
-        for i, body in enumerate(vp["bodies"]):
-            body.set_facecolor(CLASS_COLORS[i])
-            body.set_alpha(0.75)
-            body.set_edgecolor("white")
-
-        vp["cmedians"].set_color("#111")
-        vp["cmedians"].set_linewidth(1.5)
-
-        ax.set_xticks(range(N_CLASSES))
-        ax.set_xticklabels(
-            [f"[{i}]\n{EMOE_SCENE_TYPES[i]}" for i in range(N_CLASSES)],
-            fontsize=8, rotation=20, ha="right")
-
-        style_ax(ax, ylabel, ylabel=ylabel)
-
-# ──────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
 # Main
-# ──────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser()
-
-    parser.add_argument(
-        "--labels_path",
-        type=str,
-        required=True,
-        help="Path to scene_labels.jsonl"
-    )
-
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default=None,
-        help="Directory to save plots (default: same folder as labels_path)"
-    )
-
-    parser.add_argument(
-        "--top_n_tags",
-        type=int,
-        default=25,
-        help="Number of top scenario_types to show"
-    )
-
+    parser.add_argument("--labels_path", required=True)
+    parser.add_argument("--output_dir", default=None)
+    parser.add_argument("--top_n_tags", type=int, default=25)
     args = parser.parse_args()
 
     labels_path = Path(args.labels_path)
-    if not labels_path.exists():
-        raise FileNotFoundError(f"Labels file not found: {labels_path}")
-
     out_dir = Path(args.output_dir) if args.output_dir else labels_path.parent / "analysis"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"[INFO] Loading records from: {labels_path}")
     records = load_records(labels_path)
-    print(f"[INFO] Loaded {len(records):,} records")
+
+    print(f"[INFO] Loaded {len(records)} records")
 
     plot_class_distribution(records, out_dir)
+    plot_confusion_matrix(records, out_dir, args.top_n_tags)
+    plot_stage_distribution(records, out_dir)
+    plot_travel_distance(records, out_dir)
+    plot_others_deepdive(records, out_dir)
     plot_debug_signals(records, out_dir)
 
-    print("\n[DONE] All plots saved.")
+    print("[DONE] All 6 plots saved.")
 
 
 if __name__ == "__main__":
