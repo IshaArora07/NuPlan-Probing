@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-Analyze EMoE scene_labels.jsonl (6-class setup).
+Analyze EMoE scene_labels.jsonl (6-class setup)
 
 Outputs:
 1. Class distribution
-2. Confusion matrix (numbers, split into multiple images)
+2. Confusion matrix (RAW COUNTS, split, readable)
 3. Stage distribution
-4. Travel distance distribution
-5. "Others" deep dive
-6. Debug signal distributions
+4. Travel distance
+5. Others deep dive
+6. Debug signals
 """
 
 import json
@@ -23,7 +23,7 @@ import matplotlib.pyplot as plt
 
 
 # ─────────────────────────────────────────────
-# CONFIG (6 classes ONLY)
+# CONFIG
 # ─────────────────────────────────────────────
 
 EMOE_SCENE_TYPES = [
@@ -39,12 +39,12 @@ N_CLASSES = 6
 
 
 # ─────────────────────────────────────────────
-# LOAD
+# HELPERS
 # ─────────────────────────────────────────────
 
-def load_records(path: Path):
+def load_records(path):
     records = []
-    with path.open("r") as f:
+    with open(path, "r") as f:
         for line in f:
             if line.strip():
                 records.append(json.loads(line))
@@ -53,7 +53,7 @@ def load_records(path: Path):
 
 def savefig(fig, out_dir, name):
     path = out_dir / name
-    fig.savefig(path, dpi=200, bbox_inches="tight")
+    fig.savefig(path, dpi=250, bbox_inches="tight")
     plt.close(fig)
     print(f"[SAVED] {path}")
 
@@ -64,7 +64,6 @@ def savefig(fig, out_dir, name):
 
 def plot_class_distribution(records, out_dir):
     counts = Counter(r["emoe_class_id"] for r in records)
-    total = len(records)
 
     vals = [counts.get(i, 0) for i in range(N_CLASSES)]
 
@@ -76,16 +75,16 @@ def plot_class_distribution(records, out_dir):
     ax.set_title("Class Distribution")
 
     for i, v in enumerate(vals):
-        ax.text(i, v, f"{v}", ha="center")
+        ax.text(i, v, str(v), ha="center")
 
     savefig(fig, out_dir, "1_class_distribution.png")
 
 
 # ─────────────────────────────────────────────
-# 2. CONFUSION MATRIX (FIXED)
+# 2. CONFUSION MATRIX (RAW COUNTS, SPLIT)
 # ─────────────────────────────────────────────
 
-def plot_confusion_matrix_numbers(records, out_dir, top_n=25, rows_per_plot=12):
+def plot_confusion_matrix(records, out_dir, top_n=25, rows_per_plot=12):
     pair_counts = Counter()
     tag_totals = Counter()
 
@@ -97,13 +96,11 @@ def plot_confusion_matrix_numbers(records, out_dir, top_n=25, rows_per_plot=12):
 
     top_tags = [t for t, _ in tag_totals.most_common(top_n)]
 
-    matrix = np.zeros((len(top_tags), N_CLASSES))
+    matrix = np.zeros((len(top_tags), N_CLASSES), dtype=int)
+
     for i, tag in enumerate(top_tags):
         for j in range(N_CLASSES):
             matrix[i, j] = pair_counts.get((tag, j), 0)
-
-    row_sums = matrix.sum(axis=1, keepdims=True)
-    matrix = np.divide(matrix, row_sums, where=row_sums > 0)
 
     num_splits = int(np.ceil(len(top_tags) / rows_per_plot))
 
@@ -114,19 +111,22 @@ def plot_confusion_matrix_numbers(records, out_dir, top_n=25, rows_per_plot=12):
         sub_tags = top_tags[start:end]
         sub_matrix = matrix[start:end]
 
-        fig, ax = plt.subplots(figsize=(12, max(6, len(sub_tags) * 0.6)))
+        fig_height = max(6, len(sub_tags) * 0.6)
+        fig, ax = plt.subplots(figsize=(12, fig_height))
 
         for i in range(len(sub_tags)):
             for j in range(N_CLASSES):
-                ax.text(
-                    j + 0.5,
-                    i + 0.5,
-                    f"{sub_matrix[i, j]:.2f}",
-                    ha="center",
-                    va="center",
-                    fontsize=12,
-                    fontweight="bold"
-                )
+                val = sub_matrix[i, j]
+                if val > 0:
+                    ax.text(
+                        j + 0.5,
+                        i + 0.5,
+                        str(val),
+                        ha="center",
+                        va="center",
+                        fontsize=12,
+                        fontweight="bold"
+                    )
 
         ax.set_xlim(0, N_CLASSES)
         ax.set_ylim(0, len(sub_tags))
@@ -137,7 +137,7 @@ def plot_confusion_matrix_numbers(records, out_dir, top_n=25, rows_per_plot=12):
         ax.set_yticks(np.arange(len(sub_tags)) + 0.5)
         ax.set_yticklabels(sub_tags, fontsize=11)
 
-        ax.set_title(f"Confusion Matrix Part {split_idx+1}")
+        ax.set_title(f"Confusion Matrix (Counts) Part {split_idx+1}")
 
         ax.invert_yaxis()
 
@@ -205,7 +205,6 @@ def plot_others(records, out_dir):
     others = [r for r in records if r["emoe_class_id"] == 5]
 
     tags = Counter(r.get("scenario_type", "") for r in others)
-
     top = tags.most_common(15)
 
     fig, ax = plt.subplots(figsize=(10, 5))
@@ -260,7 +259,7 @@ def main():
     print(f"[INFO] Loaded {len(records)} records")
 
     plot_class_distribution(records, out_dir)
-    plot_confusion_matrix_numbers(records, out_dir)
+    plot_confusion_matrix(records, out_dir)
     plot_stage_distribution(records, out_dir)
     plot_travel_distance(records, out_dir)
     plot_others(records, out_dir)
