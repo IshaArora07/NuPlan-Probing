@@ -10,9 +10,22 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
 from matplotlib.lines import Line2D
 
+# ── import utils ─────────────────────────────
+
 sys.path.insert(0, str(Path(__file__).parent))
+
+import importlib
+
+for _name in ["load_utils", "00_load_utils"]:
+    try:
+        module = importlib.import_module(_name)
+        sys.modules["load_utils"] = module
+        break
+    except ModuleNotFoundError:
+        continue
 
 from load_utils import (
     PRIMARY_RUN, RUN_PATHS,
@@ -20,7 +33,7 @@ from load_utils import (
     get_scenario_type_col, get_output_dir,
     set_plot_style, save_fig, bar_chart, PALETTE,
     METRIC_FILES,
-    PROGRESS_FAIL_THRESH
+    PROGRESS_FAIL_THRESH,
 )
 
 set_plot_style()
@@ -37,8 +50,10 @@ def _load_merged_with_type(run_name: str, metrics=None):
     base = rr[[token_col] + ([sc_col] if sc_col else [])].copy()
     del rr
 
-    for metric_name in (metrics or METRIC_FILES):
-        df = load_metric(run_name, metric_name)
+    metrics = metrics or METRIC_FILES
+
+    for m in metrics:
+        df = load_metric(run_name, m)
         if df is None:
             continue
 
@@ -47,7 +62,7 @@ def _load_merged_with_type(run_name: str, metrics=None):
         if not num_cols:
             continue
 
-        sub = df[[tok, num_cols[0]]].rename(columns={num_cols[0]: metric_name})
+        sub = df[[tok, num_cols[0]]].rename(columns={num_cols[0]: m})
         base = base.merge(sub, left_on=token_col, right_on=tok, how="left")
 
         if tok != token_col and tok in base.columns:
@@ -58,34 +73,40 @@ def _load_merged_with_type(run_name: str, metrics=None):
     return base
 
 
-def _img_to_b64(path: Path) -> str:
+def _img_to_b64(path: Path):
     with open(path, "rb") as f:
         return base64.b64encode(f.read()).decode()
 
 
 # ─────────────────────────────────────────────
-# SCRIPT 6
+# SCRIPT 6 — Comfort
 # ─────────────────────────────────────────────
 
 def script_6_comfort_analysis(run_name: str):
-    print(f"\nSCRIPT 6 — Comfort [{run_name}]")
+    print("\nSCRIPT 6 — Comfort Analysis")
 
-    metrics = ["ego_jerk", "ego_lat_acceleration", "ego_lon_acceleration",
-               "ego_yaw_rate"]
+    metrics = [
+        "ego_jerk",
+        "ego_lat_acceleration",
+        "ego_lon_acceleration",
+        "ego_lon_jerk",
+        "ego_yaw_rate",
+    ]
 
     merged = _load_merged_with_type(run_name, metrics + ["ego_is_comfortable"])
 
     if "ego_is_comfortable" not in merged.columns:
-        print("Missing ego_is_comfortable")
-        return
+        print("Missing comfort metric")
+        return merged
 
     rows = []
+
     for m in metrics:
         if m not in merged.columns:
             continue
 
         sub = merged[[m, "ego_is_comfortable"]].dropna()
-        if len(sub) < 10:
+        if len(sub) < 5:
             continue
 
         rows.append({
@@ -93,51 +114,66 @@ def script_6_comfort_analysis(run_name: str):
             "corr": sub[m].corr(sub["ego_is_comfortable"])
         })
 
-    df = pd.DataFrame(rows).sort_values("corr", ascending=False)
-    print(df)
+    df = pd.DataFrame(rows).sort_values("corr")
 
+    print(df)
     return merged, df
 
 
 # ─────────────────────────────────────────────
-# SCRIPT 7
+# SCRIPT 7 — Progress vs Safety
 # ─────────────────────────────────────────────
 
 def script_7_progress_vs_safety(runs=None):
     print("\nSCRIPT 7 — Progress vs Safety")
 
-    runs = runs or list(RUN_PATHS.keys())
-    results = {}
+    if runs is None:
+        runs = list(RUN_PATHS.keys())
 
-    for run in runs:
+    data = {}
+
+    for r in runs:
         try:
-            df = _load_merged_with_type(run, [
-                "no_ego_at_fault_collisions",
-                "ego_is_making_progress"
+            df = _load_merged_with_type(r, [
+                "ego_is_making_progress",
+                "no_ego_at_fault_collisions"
             ])
 
-            df["safety"] = df["no_ego_at_fault_collisions"]
-            df["progress"] = df["ego_is_making_progress"]
+            if "ego_is_making_progress" not in df.columns:
+                continue
 
-            results[run] = df
+            df["progress"] = df["ego_is_making_progress"]
+            df["safety"] = df["no_ego_at_fault_collisions"]
+
+            data[r] = df
+
         except:
             continue
 
-    print(f"Loaded {len(results)} runs")
-    return results
+    for r, df in data.items():
+        plt.figure()
+        plt.scatter(df["safety"], df["progress"], alpha=0.3)
+        plt.title(r)
+        save_fig(plt.gcf(), f"s7_{r}", subdir="behaviour")
+
+    return data
 
 
 # ─────────────────────────────────────────────
-# SCRIPT 8
+# SCRIPT 8 — Stopping
 # ─────────────────────────────────────────────
 
 def script_8_stopping_analysis(run_name: str):
-    print(f"\nSCRIPT 8 — Stopping [{run_name}]")
+    print("\nSCRIPT 8 — Stopping")
 
-    df = _load_merged_with_type(run_name, ["ego_is_making_progress"])
+    df = _load_merged_with_type(run_name, [
+        "ego_is_making_progress",
+        "ego_progress_along_expert_route"
+    ])
 
-    if "ego_is_making_progress" not in df:
-        return
+    if "ego_is_making_progress" not in df.columns:
+        print("Missing progress metric")
+        return df
 
     df["stopped"] = df["ego_is_making_progress"] < PROGRESS_FAIL_THRESH
 
@@ -147,44 +183,40 @@ def script_8_stopping_analysis(run_name: str):
 
 
 # ─────────────────────────────────────────────
-# SCRIPT 9
+# SCRIPT 9 — Runner errors
 # ─────────────────────────────────────────────
 
 def script_9_runner_errors(run_name: str):
-    print(f"\nSCRIPT 9 — Errors [{run_name}]")
+    print("\nSCRIPT 9 — Errors")
 
     rr = load_runner_report(run_name)
 
-    print("Columns:", rr.columns.tolist())
-
-    err_cols = [c for c in rr.columns if "error" in c.lower()]
-
-    for c in err_cols:
-        print(c, rr[c].notna().sum())
+    print(rr.head())
+    print(rr.columns)
 
     return rr
 
 
 # ─────────────────────────────────────────────
-# SCRIPT 10
+# SCRIPT 10 — Dashboard
 # ─────────────────────────────────────────────
 
 def script_10_html_dashboard(run_name: str):
-    print(f"\nSCRIPT 10 — HTML [{run_name}]")
+    print("\nSCRIPT 10 — HTML")
 
     out = get_output_dir() / f"dashboard_{run_name}.html"
 
     html = f"""
     <html>
-    <body>
-    <h1>Run {run_name}</h1>
+    <body style="background:black;color:white;">
+    <h1>{run_name}</h1>
     <p>Dashboard generated</p>
     </body>
     </html>
     """
 
     out.write_text(html)
-    print("Saved:", out)
+    print(out)
 
     return out
 
@@ -221,3 +253,5 @@ if __name__ == "__main__":
         script_9_runner_errors(args.run)
     elif args.script == 10:
         script_10_html_dashboard(args.run)
+    else:
+        print("Invalid script")
