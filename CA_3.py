@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 analyse_improvement.py — Scripts 11–12
 """
@@ -10,17 +9,16 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
 
-# FIX: correct __file__
 sys.path.insert(0, str(Path(__file__).parent))
 
 from load_utils import (
     PRIMARY_RUN, RUN_PATHS,
-    load_runner_report, load_all_metrics,
+    load_runner_report, load_metric,
     get_scenario_type_col, get_output_dir,
     set_plot_style, save_fig, PALETTE,
-    PROGRESS_FAIL_THRESH,
+    METRIC_FILES,   # FIXED: missing import
+    PROGRESS_FAIL_THRESH
 )
 
 set_plot_style()
@@ -29,161 +27,134 @@ set_plot_style()
 # HELPERS
 # ─────────────────────────────────────────────
 
-def _load_merged_with_type(run_name: str) -> pd.DataFrame:
-    merged = load_all_metrics(run_name)
+def _load_merged_with_type(run_name: str, metrics=None):
+    rr = load_runner_report(run_name)
 
-    if get_scenario_type_col(merged) is None:
-        try:
-            rr = load_runner_report(run_name)
-            token_col = merged.columns[0]
+    token_col = rr.columns[0]
+    sc_col = get_scenario_type_col(rr)
 
-            if token_col in rr.columns and "scenario_type" in rr.columns:
-                merged = pd.merge(
-                    merged,
-                    rr[[token_col, "scenario_type"]],
-                    on=token_col,
-                    how="left",
-                )
-        except Exception:
-            pass
+    base = rr[[token_col] + ([sc_col] if sc_col else [])].copy()
+    del rr
 
-    return merged
+    for metric_name in (metrics or METRIC_FILES):
+        df = load_metric(run_name, metric_name)
+        if df is None:
+            continue
+
+        tok = df.columns[0]
+        num_cols = [c for c in df.columns if c != tok and pd.api.types.is_numeric_dtype(df[c])]
+        if not num_cols:
+            continue
+
+        sub = df[[tok, num_cols[0]]].rename(columns={num_cols[0]: metric_name})
+        base = base.merge(sub, left_on=token_col, right_on=tok, how="left")
+
+        if tok != token_col and tok in base.columns:
+            base = base.drop(columns=[tok])
+
+        del df, sub
+
+    return base
 
 
-def _failure_rate(series: pd.Series, threshold: float = 0.5):
+def _failure_rate(series):
     s = series.dropna()
-    if len(s) == 0:
-        return np.nan
-    return (s < threshold).mean()
-
-
-def _severity(rate):
-    if np.isnan(rate):
-        return "unknown"
-    if rate >= 0.4:
-        return "CRITICAL"
-    if rate >= 0.2:
-        return "HIGH"
-    if rate >= 0.1:
-        return "MEDIUM"
-    return "LOW"
+    return np.nan if len(s) == 0 else (s < 0.5).mean()
 
 
 # ─────────────────────────────────────────────
-# SCRIPT 11 — Braking
+# SCRIPT 11
 # ─────────────────────────────────────────────
 
 def script_11_braking_analysis(run_name: str):
-    print(f"\n=== SCRIPT 11 — Braking [{run_name}] ===")
+    print(f"\nSCRIPT 11 — Braking [{run_name}]")
 
-    merged = _load_merged_with_type(run_name)
-    total = len(merged)
+    metrics = [
+        "ego_lon_acceleration",
+        "ego_lon_jerk",
+        "time_to_collision_within_bound",
+        "ego_is_comfortable"
+    ]
 
-    if "ego_lon_acceleration" not in merged.columns:
-        print("[WARN] Missing ego_lon_acceleration")
-        return merged
+    df = _load_merged_with_type(run_name, metrics)
 
-    # classify
-    merged["harsh_brake"] = merged["ego_lon_acceleration"] < 0.5
+    if "ego_lon_acceleration" not in df:
+        print("Missing lon acceleration")
+        return df
 
-    n = merged["harsh_brake"].sum()
-    print(f"Harsh braking: {n}/{total} ({100*n/total:.1f}%)")
+    df["harsh"] = df["ego_lon_acceleration"] < 0.5
 
-    # TTC relation
-    if "time_to_collision_within_bound" in merged.columns:
-        phantom = (merged["harsh_brake"]) & (merged["time_to_collision_within_bound"] > 0.8)
-        reactive = (merged["harsh_brake"]) & (merged["time_to_collision_within_bound"] < 0.5)
+    print("Harsh braking rate:", df["harsh"].mean())
 
-        print(f"Phantom braking: {phantom.sum()} ({100*phantom.mean():.1f}%)")
-        print(f"Reactive braking: {reactive.sum()} ({100*reactive.mean():.1f}%)")
-
-    return merged
-
-
-# ─────────────────────────────────────────────
-# SCRIPT 12 — Recommendations
-# ─────────────────────────────────────────────
-
-KEY_METRICS = [
-    "ego_is_comfortable",
-    "ego_is_making_progress",
-    "no_ego_at_fault_collisions",
-    "drivable_area_compliance",
-    "time_to_collision_within_bound",
-]
-
-def script_12_t8_recommendations(run_name: str, compare_runs=None):
-    print(f"\n=== SCRIPT 12 — T8 Recommendations [{run_name}] ===")
-
-    merged = _load_merged_with_type(run_name)
-
-    token_col = merged.columns[0]
-    sc_col = get_scenario_type_col(merged)
-
-    # global means
-    metrics = [m for m in KEY_METRICS if m in merged.columns]
-    means = {m: merged[m].mean() for m in metrics}
-
-    print("\nGlobal metric means:")
-    for k, v in means.items():
-        print(f"{k:<40} {v:.3f}")
-
-    # failure ranking
-    ranking = []
-    for m in metrics:
-        fr = _failure_rate(merged[m])
-        ranking.append((m, fr, _severity(fr)))
-
-    ranking.sort(key=lambda x: x[1], reverse=True)
-
-    print("\nFailure ranking:")
-    for m, fr, sev in ranking:
-        print(f"{m:<40} {fr:.3f}  {sev}")
-
-    # simple recommendations
-    print("\nTop recommendations:")
-
-    actions = []
-
-    if means.get("ego_is_making_progress", 1) < 0.75:
-        actions.append("Increase forward anchors / reduce conservative bias")
-
-    if means.get("ego_is_comfortable", 1) < 0.8:
-        actions.append("Increase smoothness / yaw penalties")
-
-    if means.get("no_ego_at_fault_collisions", 1) < 0.9:
-        actions.append("Improve turn anchors + collision loss weight")
-
-    if means.get("time_to_collision_within_bound", 1) < 0.85:
-        actions.append("Strengthen TTC / ESDF safety modeling")
-
-    for i, a in enumerate(actions[:3], 1):
-        print(f"{i}. {a}")
-
-    # save CSV
-    outdir = get_output_dir() / "improvement"
-    outdir.mkdir(parents=True, exist_ok=True)
-
-    df = pd.DataFrame(ranking, columns=["metric", "fail_rate", "severity"])
-    df.to_csv(outdir / f"s12_priority_{run_name}.csv", index=False)
-
-    print(f"\nSaved → {outdir}")
+    if "time_to_collision_within_bound" in df:
+        df["phantom"] = df["harsh"] & (df["time_to_collision_within_bound"] > 0.8)
+        print("Phantom braking:", df["phantom"].mean())
 
     return df
+
+
+# ─────────────────────────────────────────────
+# SCRIPT 12
+# ─────────────────────────────────────────────
+
+def script_12_t8_recommendations(run_name: str, runs_for_comparison=None):
+    print(f"\nSCRIPT 12 — Recommendations [{run_name}]")
+
+    # IMPORTANT: restrict metrics → avoid OOM
+    key_metrics = [
+        "ego_is_comfortable",
+        "ego_is_making_progress",
+        "no_ego_at_fault_collisions",
+        "time_to_collision_within_bound",
+        "ego_lon_acceleration",
+        "ego_lon_jerk",
+    ]
+
+    df = _load_merged_with_type(run_name, key_metrics)
+
+    results = []
+
+    for m in key_metrics:
+        if m not in df:
+            continue
+
+        fr = _failure_rate(df[m])
+
+        results.append({
+            "metric": m,
+            "mean": df[m].mean(),
+            "fail_rate": fr
+        })
+
+    summary = pd.DataFrame(results).sort_values("fail_rate", ascending=False)
+
+    print("\nPriority metrics:")
+    print(summary)
+
+    # Top 3 recommendations
+    print("\nTop issues:")
+    for _, row in summary.head(3).iterrows():
+        print(f" - {row['metric']} (fail rate {row['fail_rate']:.2f})")
+
+    out = get_output_dir() / f"s12_summary_{run_name}.csv"
+    summary.to_csv(out, index=False)
+
+    print("Saved:", out)
+
+    return summary
 
 
 # ─────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────
 
-def run_all(run_name, compare_runs=None):
+def run_all_improvement(run_name: str, compare_runs=None):
     script_11_braking_analysis(run_name)
     script_12_t8_recommendations(run_name, compare_runs)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-
     parser.add_argument("--run", default=PRIMARY_RUN)
     parser.add_argument("--script", type=int, default=0)
     parser.add_argument("--runs", nargs="+", default=None)
@@ -191,10 +162,10 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.script == 0:
-        run_all(args.run, args.runs)
+        run_all_improvement(args.run, args.runs)
     elif args.script == 11:
         script_11_braking_analysis(args.run)
     elif args.script == 12:
         script_12_t8_recommendations(args.run, args.runs)
     else:
-        print("Invalid script")
+        print("Invalid script number")
