@@ -1,6 +1,5 @@
 """
 analyse_core.py — Scripts 1–5
-EMoE Simulation Core Diagnostics
 """
 
 import argparse
@@ -10,13 +9,23 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-# ── import shared utils ──────────────────────────────────────
+# ── import shared utils ─────────────────────────────────────
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+# Support both load_utils and 00_load_utils
+import importlib
+for _name in ["load_utils", "00_load_utils"]:
+    try:
+        module = importlib.import_module(_name)
+        sys.modules["load_utils"] = module
+        break
+    except ModuleNotFoundError:
+        continue
+
 from load_utils import (
     PRIMARY_RUN, RUN_PATHS,
-    load_runner_report, load_aggregator, load_all_metrics, load_metric,
+    load_runner_report, load_aggregator, load_metric,
     get_scenario_type_col, get_output_dir,
     set_plot_style, save_fig, bar_chart, PALETTE,
     METRIC_FILES,
@@ -24,130 +33,104 @@ from load_utils import (
 
 set_plot_style()
 
-# ─────────────────────────────────────────────────────────────
-# SCRIPT 1 — Overview
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# SCRIPT 1
+# ─────────────────────────────────────────────
 
 def script_1_overview(run_name: str):
-    print("\n" + "="*60)
-    print(f"SCRIPT 1 — Overview & Sanity Check  [{run_name}]")
-    print("="*60)
+    print("\n" + "=" * 60)
+    print(f"SCRIPT 1 — Overview [{run_name}]")
+    print("=" * 60)
 
     rr = load_runner_report(run_name)
     total = len(rr)
 
     print(f"\nTotal scenarios: {total}")
 
-    status_col = next((c for c in rr.columns if c.lower() in
-                       ["status", "result", "success", "passed"]), None)
-
+    status_col = next((c for c in ["status", "result", "success"] if c in rr.columns), None)
     if status_col:
         counts = rr[status_col].value_counts()
         for s, c in counts.items():
-            print(f"  {s:<20} {c:>5} ({100*c/total:.1f}%)")
+            print(f"{s}: {c} ({100*c/total:.1f}%)")
 
     sc_col = get_scenario_type_col(rr)
     if sc_col:
-        type_counts = rr[sc_col].value_counts()
-
-        fig, ax = plt.subplots(figsize=(9, 4))
-        bar_chart(ax,
-                  labels=type_counts.index.tolist(),
-                  values=type_counts.values.tolist(),
-                  color=PALETTE.get(run_name, "#F28C38"),
-                  title=f"[{run_name}] Scenario Count by Type",
-                  ylabel="Count")
-        save_fig(fig, f"s1_scenario_distribution_{run_name}", subdir="core")
+        counts = rr[sc_col].value_counts()
+        print("\nScenario types:")
+        print(counts)
 
     agg = load_aggregator(run_name)
-    print("\nAggregator columns:", list(agg.columns))
+    print("\nAggregator:")
+    print(agg)
 
-    print("\n[Script 1 complete]")
     return rr, agg
 
 
-# ─────────────────────────────────────────────────────────────
-# SCRIPT 2 — Metric analysis
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# SCRIPT 2
+# ─────────────────────────────────────────────
 
 def script_2_metric_deep_dive(run_name: str):
-    print("\n" + "="*60)
-    print(f"SCRIPT 2 — Metric Analysis [{run_name}]")
-    print("="*60)
+    print("\nSCRIPT 2 — Metric Analysis")
 
     rows = []
 
-    for metric_name in METRIC_FILES:
-        df = load_metric(run_name, metric_name)
+    for m in METRIC_FILES:
+        df = load_metric(run_name, m)
         if df is None:
             continue
 
-        token_col = df.columns[0]
-        num_cols = [c for c in df.columns
-                    if c != token_col and pd.api.types.is_numeric_dtype(df[c])]
-
+        tok = df.columns[0]
+        num_cols = [c for c in df.columns if c != tok and pd.api.types.is_numeric_dtype(df[c])]
         if not num_cols:
             continue
 
         col = df[num_cols[0]].dropna()
-
         if len(col) == 0:
             continue
 
-        pass_rate = (col >= 0.5).mean()
-        fail_rate = (col < 0.5).mean()
-
         rows.append({
-            "metric": metric_name,
-            "mean": round(col.mean(), 4),
-            "fail_rate": round(fail_rate, 4),
-            "n": len(col),
+            "metric": m,
+            "mean": col.mean(),
+            "fail_rate": (col < 0.5).mean()
         })
 
         del df
 
     summary = pd.DataFrame(rows).sort_values("fail_rate", ascending=False)
+    print(summary)
 
-    print(summary.to_string(index=False))
-
-    out_csv = get_output_dir() / "core" / f"s2_metric_summary_{run_name}.csv"
-    out_csv.parent.mkdir(parents=True, exist_ok=True)
-    summary.to_csv(out_csv, index=False)
-
-    print("\n[Script 2 complete]")
     return summary
 
 
-# ─────────────────────────────────────────────────────────────
-# SCRIPT 3 — Scenario breakdown (memory safe)
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# SCRIPT 3
+# ─────────────────────────────────────────────
 
 def script_3_scenario_type_breakdown(run_name: str):
-    print("\n" + "="*60)
-    print(f"SCRIPT 3 — Scenario Breakdown [{run_name}]")
-    print("="*60)
+    print("\nSCRIPT 3 — Scenario Type Breakdown")
 
     rr = load_runner_report(run_name)
     sc_col = get_scenario_type_col(rr)
+    token_col = rr.columns[0]
 
     if sc_col is None:
         print("No scenario_type found")
         return None
 
-    token_col = rr.columns[0]
     type_lookup = rr.set_index(token_col)[sc_col].to_dict()
+    del rr
 
     from collections import defaultdict
     grouped = defaultdict(lambda: defaultdict(list))
 
-    for metric_name in METRIC_FILES:
-        df = load_metric(run_name, metric_name)
+    for m in METRIC_FILES:
+        df = load_metric(run_name, m)
         if df is None:
             continue
 
         tok = df.columns[0]
-        num_cols = [c for c in df.columns
-                    if c != tok and pd.api.types.is_numeric_dtype(df[c])]
+        num_cols = [c for c in df.columns if c != tok and pd.api.types.is_numeric_dtype(df[c])]
         if not num_cols:
             continue
 
@@ -155,80 +138,96 @@ def script_3_scenario_type_breakdown(run_name: str):
 
         for _, row in df[[tok, val_col]].iterrows():
             stype = type_lookup.get(row[tok])
-            if stype:
-                grouped[metric_name][stype].append(row[val_col])
+            if stype is not None:
+                grouped[m][stype].append(row[val_col])
 
         del df
 
     rows = {}
-    for metric, type_vals in grouped.items():
-        rows[metric] = {t: np.mean(v) for t, v in type_vals.items()}
-
-    df_out = pd.DataFrame(rows)
-
-    print(df_out.to_string())
-
-    print("\n[Script 3 complete]")
-    return df_out
-
-
-# ─────────────────────────────────────────────────────────────
-# SCRIPT 4 — Cross-run
-# ─────────────────────────────────────────────────────────────
-
-def script_4_cross_run_comparison(runs=None):
-    print("\n" + "="*60)
-    print("SCRIPT 4 — Cross-run")
-    print("="*60)
-
-    runs = runs or list(RUN_PATHS.keys())
-
-    rows = []
-
-    for run in runs:
-        try:
-            agg = load_aggregator(run)
-            val = agg.select_dtypes("number").mean().mean()
-            rows.append({"run": run, "score": val})
-        except:
-            continue
+    for m, d in grouped.items():
+        rows[m] = {k: np.mean(v) for k, v in d.items() if v}
 
     df = pd.DataFrame(rows)
     print(df)
 
-    print("\n[Script 4 complete]")
     return df
 
 
-# ─────────────────────────────────────────────────────────────
-# SCRIPT 5 — Worst cases
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# SCRIPT 4
+# ─────────────────────────────────────────────
+
+def script_4_cross_run_comparison(runs=None):
+    print("\nSCRIPT 4 — Cross Run")
+
+    if runs is None:
+        runs = list(RUN_PATHS.keys())
+
+    rows = []
+
+    for r in runs:
+        try:
+            agg = load_aggregator(r)
+            row = {"run": r}
+            for c in agg.columns:
+                if pd.api.types.is_numeric_dtype(agg[c]):
+                    row[c] = agg[c].mean()
+            rows.append(row)
+        except:
+            continue
+
+    df = pd.DataFrame(rows).set_index("run")
+    print(df)
+
+    return df
+
+
+# ─────────────────────────────────────────────
+# SCRIPT 5
+# ─────────────────────────────────────────────
 
 def script_5_failure_cases(run_name: str, top_n=30):
-    print("\n" + "="*60)
-    print(f"SCRIPT 5 — Worst cases [{run_name}]")
-    print("="*60)
+    print("\nSCRIPT 5 — Worst Cases")
 
-    merged = load_all_metrics(run_name)
-    token_col = merged.columns[0]
+    rr = load_runner_report(run_name)
+    token_col = rr.columns[0]
 
-    metric_cols = [c for c in merged.columns if c != token_col]
+    base = rr[[token_col]].copy()
+    del rr
 
-    merged["failure_score"] = merged[metric_cols].apply(
-        lambda r: (1 - r).mean(), axis=1
-    )
+    scores = {str(t): {} for t in base[token_col]}
 
-    worst = merged.sort_values("failure_score", ascending=False).head(top_n)
+    for m in METRIC_FILES:
+        df = load_metric(run_name, m)
+        if df is None:
+            continue
 
-    print(worst[[token_col, "failure_score"]].head())
+        tok = df.columns[0]
+        num_cols = [c for c in df.columns if c != tok and pd.api.types.is_numeric_dtype(df[c])]
+        if not num_cols:
+            continue
 
-    print("\n[Script 5 complete]")
+        val_col = num_cols[0]
+
+        for _, row in df[[tok, val_col]].iterrows():
+            scores[str(row[tok])][m] = row[val_col]
+
+        del df
+
+    for m in METRIC_FILES:
+        base[m] = base[token_col].apply(lambda t: scores[str(t)].get(m, np.nan))
+
+    base["failure_score"] = base[METRIC_FILES].apply(lambda r: (1 - r).mean(), axis=1)
+
+    worst = base.sort_values("failure_score", ascending=False).head(top_n)
+    print(worst.head())
+
     return worst
 
 
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
 # MAIN
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
 
 def run_all_core(run_name: str, compare_runs=None):
     script_1_overview(run_name)
@@ -257,3 +256,5 @@ if __name__ == "__main__":
         script_4_cross_run_comparison()
     elif args.script == 5:
         script_5_failure_cases(args.run)
+    else:
+        print("Invalid script")
