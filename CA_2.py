@@ -1,7 +1,5 @@
-#!/usr/bin/env python3
 """
 analyse_behaviour.py — Scripts 6–10
-EMoE Simulation Behavioural Deep-Dive
 """
 
 import argparse
@@ -14,16 +12,15 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 
-# FIX: correct __file__ usage
 sys.path.insert(0, str(Path(__file__).parent))
 
 from load_utils import (
     PRIMARY_RUN, RUN_PATHS,
-    load_runner_report, load_all_metrics,
+    load_runner_report, load_metric,
     get_scenario_type_col, get_output_dir,
-    set_plot_style, save_fig, PALETTE,
-    HARD_BRAKE_THRESHOLD, HIGH_LAT_ACCEL, HIGH_YAW_RATE,
-    PROGRESS_FAIL_THRESH, TTC_FAIL_THRESH,
+    set_plot_style, save_fig, bar_chart, PALETTE,
+    METRIC_FILES,
+    PROGRESS_FAIL_THRESH
 )
 
 set_plot_style()
@@ -32,25 +29,33 @@ set_plot_style()
 # HELPERS
 # ─────────────────────────────────────────────
 
-def _load_merged_with_type(run_name: str) -> pd.DataFrame:
-    merged = load_all_metrics(run_name)
+def _load_merged_with_type(run_name: str, metrics=None):
+    rr = load_runner_report(run_name)
+    token_col = rr.columns[0]
+    sc_col = get_scenario_type_col(rr)
 
-    if get_scenario_type_col(merged) is None:
-        try:
-            rr = load_runner_report(run_name)
-            token_col = merged.columns[0]
+    base = rr[[token_col] + ([sc_col] if sc_col else [])].copy()
+    del rr
 
-            if token_col in rr.columns and "scenario_type" in rr.columns:
-                merged = pd.merge(
-                    merged,
-                    rr[[token_col, "scenario_type"]],
-                    on=token_col,
-                    how="left",
-                )
-        except Exception:
-            pass
+    for metric_name in (metrics or METRIC_FILES):
+        df = load_metric(run_name, metric_name)
+        if df is None:
+            continue
 
-    return merged
+        tok = df.columns[0]
+        num_cols = [c for c in df.columns if c != tok and pd.api.types.is_numeric_dtype(df[c])]
+        if not num_cols:
+            continue
+
+        sub = df[[tok, num_cols[0]]].rename(columns={num_cols[0]: metric_name})
+        base = base.merge(sub, left_on=token_col, right_on=tok, how="left")
+
+        if tok != token_col and tok in base.columns:
+            base = base.drop(columns=[tok])
+
+        del df, sub
+
+    return base
 
 
 def _img_to_b64(path: Path) -> str:
@@ -59,164 +64,136 @@ def _img_to_b64(path: Path) -> str:
 
 
 # ─────────────────────────────────────────────
-# SCRIPT 6 — Comfort correlations
+# SCRIPT 6
 # ─────────────────────────────────────────────
 
 def script_6_comfort_analysis(run_name: str):
-    print(f"\n=== SCRIPT 6 — Comfort [{run_name}] ===")
+    print(f"\nSCRIPT 6 — Comfort [{run_name}]")
 
-    merged = _load_merged_with_type(run_name)
+    metrics = ["ego_jerk", "ego_lat_acceleration", "ego_lon_acceleration",
+               "ego_yaw_rate"]
+
+    merged = _load_merged_with_type(run_name, metrics + ["ego_is_comfortable"])
 
     if "ego_is_comfortable" not in merged.columns:
-        print("[WARN] Missing ego_is_comfortable")
+        print("Missing ego_is_comfortable")
         return
-
-    metrics = [m for m in [
-        "ego_jerk",
-        "ego_lat_acceleration",
-        "ego_lon_acceleration",
-        "ego_yaw_rate",
-    ] if m in merged.columns]
 
     rows = []
     for m in metrics:
-        sub = merged[["ego_is_comfortable", m]].dropna()
+        if m not in merged.columns:
+            continue
+
+        sub = merged[[m, "ego_is_comfortable"]].dropna()
         if len(sub) < 10:
             continue
 
-        corr = sub["ego_is_comfortable"].corr(sub[m])
         rows.append({
             "metric": m,
-            "corr": round(corr, 4)
+            "corr": sub[m].corr(sub["ego_is_comfortable"])
         })
 
     df = pd.DataFrame(rows).sort_values("corr", ascending=False)
-    print(df.to_string(index=False))
+    print(df)
 
     return merged, df
 
 
 # ─────────────────────────────────────────────
-# SCRIPT 7 — Progress vs Safety
+# SCRIPT 7
 # ─────────────────────────────────────────────
 
 def script_7_progress_vs_safety(runs=None):
-    print("\n=== SCRIPT 7 — Progress vs Safety ===")
+    print("\nSCRIPT 7 — Progress vs Safety")
 
-    if runs is None:
-        runs = list(RUN_PATHS.keys())
-
-    results = []
+    runs = runs or list(RUN_PATHS.keys())
+    results = {}
 
     for run in runs:
         try:
-            merged = _load_merged_with_type(run)
-
-            s_cols = [c for c in [
+            df = _load_merged_with_type(run, [
                 "no_ego_at_fault_collisions",
-                "time_to_collision_within_bound"
-            ] if c in merged.columns]
+                "ego_is_making_progress"
+            ])
 
-            p_cols = [c for c in [
-                "ego_is_making_progress",
-                "ego_progress_along_expert_route"
-            ] if c in merged.columns]
+            df["safety"] = df["no_ego_at_fault_collisions"]
+            df["progress"] = df["ego_is_making_progress"]
 
-            if not s_cols or not p_cols:
-                continue
+            results[run] = df
+        except:
+            continue
 
-            merged["safety"] = merged[s_cols].mean(axis=1)
-            merged["progress"] = merged[p_cols].mean(axis=1)
+    print(f"Loaded {len(results)} runs")
+    return results
 
-            results.append({
-                "run": run,
-                "safety_mean": merged["safety"].mean(),
-                "progress_mean": merged["progress"].mean()
-            })
 
-        except Exception as e:
-            print(f"[WARN] {run}: {e}")
+# ─────────────────────────────────────────────
+# SCRIPT 8
+# ─────────────────────────────────────────────
 
-    df = pd.DataFrame(results)
-    print(df.to_string(index=False))
+def script_8_stopping_analysis(run_name: str):
+    print(f"\nSCRIPT 8 — Stopping [{run_name}]")
+
+    df = _load_merged_with_type(run_name, ["ego_is_making_progress"])
+
+    if "ego_is_making_progress" not in df:
+        return
+
+    df["stopped"] = df["ego_is_making_progress"] < PROGRESS_FAIL_THRESH
+
+    print(df["stopped"].mean())
 
     return df
 
 
 # ─────────────────────────────────────────────
-# SCRIPT 8 — Stopping behaviour
-# ─────────────────────────────────────────────
-
-def script_8_stopping_analysis(run_name: str):
-    print(f"\n=== SCRIPT 8 — Stopping [{run_name}] ===")
-
-    merged = _load_merged_with_type(run_name)
-
-    if "ego_is_making_progress" not in merged.columns:
-        print("[WARN] Missing progress metric")
-        return
-
-    stopped = merged["ego_is_making_progress"] < PROGRESS_FAIL_THRESH
-
-    total = len(merged)
-    n_stop = stopped.sum()
-
-    print(f"Stopped: {n_stop} / {total} ({100*n_stop/total:.1f}%)")
-
-    return merged
-
-
-# ─────────────────────────────────────────────
-# SCRIPT 9 — Runner health
+# SCRIPT 9
 # ─────────────────────────────────────────────
 
 def script_9_runner_errors(run_name: str):
-    print(f"\n=== SCRIPT 9 — Infra [{run_name}] ===")
+    print(f"\nSCRIPT 9 — Errors [{run_name}]")
 
     rr = load_runner_report(run_name)
 
-    total = len(rr)
-    print(f"Total: {total}")
+    print("Columns:", rr.columns.tolist())
 
-    status_col = next((c for c in rr.columns if "status" in c.lower()), None)
+    err_cols = [c for c in rr.columns if "error" in c.lower()]
 
-    if status_col:
-        counts = rr[status_col].value_counts()
-        print(counts)
+    for c in err_cols:
+        print(c, rr[c].notna().sum())
 
     return rr
 
 
 # ─────────────────────────────────────────────
-# SCRIPT 10 — HTML dashboard
+# SCRIPT 10
 # ─────────────────────────────────────────────
 
 def script_10_html_dashboard(run_name: str):
-    print(f"\n=== SCRIPT 10 — HTML [{run_name}] ===")
+    print(f"\nSCRIPT 10 — HTML [{run_name}]")
 
-    out = get_output_dir()
-    path = out / f"behaviour_dashboard_{run_name}.html"
+    out = get_output_dir() / f"dashboard_{run_name}.html"
 
     html = f"""
     <html>
-    <body style="background:#111;color:white;font-family:monospace">
-    <h1>EMoE Behaviour — {run_name}</h1>
-    <p>Generated dashboard</p>
+    <body>
+    <h1>Run {run_name}</h1>
+    <p>Dashboard generated</p>
     </body>
     </html>
     """
 
-    path.write_text(html)
-    print(f"Saved → {path}")
+    out.write_text(html)
+    print("Saved:", out)
 
-    return path
+    return out
 
 
 # ─────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────
 
-def run_all(run_name, compare_runs=None):
+def run_all_behaviour(run_name: str, compare_runs=None):
     script_6_comfort_analysis(run_name)
     script_7_progress_vs_safety(compare_runs)
     script_8_stopping_analysis(run_name)
@@ -226,7 +203,6 @@ def run_all(run_name, compare_runs=None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-
     parser.add_argument("--run", default=PRIMARY_RUN)
     parser.add_argument("--script", type=int, default=0)
     parser.add_argument("--runs", nargs="+", default=None)
@@ -234,7 +210,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.script == 0:
-        run_all(args.run, args.runs)
+        run_all_behaviour(args.run, args.runs)
     elif args.script == 6:
         script_6_comfort_analysis(args.run)
     elif args.script == 7:
@@ -245,5 +221,3 @@ if __name__ == "__main__":
         script_9_runner_errors(args.run)
     elif args.script == 10:
         script_10_html_dashboard(args.run)
-    else:
-        print("Invalid script")
