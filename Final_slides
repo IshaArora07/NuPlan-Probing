@@ -1,0 +1,330 @@
+
+⸻
+
+Slide 2 — Problem Setup
+	•	Learned planners (PLUTO, PDM, GameFormer) minimise average trajectory error across all scenario types
+	•	Implicit assumption: one model with enough capacity handles all behaviours
+	•	In reality:
+	•	Different scenarios require fundamentally different behaviours (e.g. stopping vs continuous motion)
+	•	A single model must represent conflicting behaviours
+	•	WTA training often collapses to a dominant mode in practice
+
+Core question:
+
+What if the planner knew the scene type and activated a specialist?
+
+⸻
+
+Slide 3 — Why nuPlan Makes This Non-Trivial
+	•	Offline metrics (minADE / minFDE):
+	•	Averaged over recorded frames
+	•	Evaluate imitation
+	•	Closed-loop simulation:
+	•	Reactive agents
+	•	Traffic rule penalties
+	•	Progress tracking
+	•	Evaluate decision-making
+	•	Example:
+	•	A planner that never stops:
+	•	Good offline score
+	•	Fails in simulation
+	•	The evaluation gap is structural:
+	•	Offline metrics do not capture stop behaviour, yield compliance, or reactive response
+	•	Key insight: Offline metrics ≠ driving quality
+	•	Design target: optimise for simulation, not regression
+
+⸻
+
+Slide 4 — Scene Classification
+	•	6 scene classes (map topology + ego intent):
+	•	Left turn (intersection)
+	•	Straight (intersection)
+	•	Right turn (intersection)
+	•	Straight (non-intersection)
+	•	U-turn
+	•	Complex / other
+	•	Dataset:
+	•	~800K scenarios
+	•	Long-tailed distribution
+
+Key issue:
+
+Class imbalance → router ignores rare but critical behaviours
+
+⸻
+
+Slide 5 — EMoE Architecture
+
+Built on PLUTO with 3 additions:
+	•	SceneRouter
+	•	Predicts scene class
+	•	Inverse-frequency weighted loss
+	•	SceneModeQueryGenerator (Hard)
+	•	Routes each sample to exactly one expert (R = 1)
+	•	EMoEPlanningDecoder
+	•	Expert-specific decoding
+	•	Ka = 24 anchors
+	•	FOPE positional encoding
+	•	score_attn → pi_head → output
+
+Design choice — Hard routing (R = 1):
+	•	One expert accountable per scene
+	•	Avoids gradient interference between experts
+	•	Interpretable at inference
+
+Key idea:
+
+Each expert learns a restricted behaviour space → reduces interference
+
+⸻
+
+Slide 6 — What is an Anchor?
+	•	Each anchor = a learnable trajectory template representing one possible future
+	•	Ka = 24 anchors collectively cover behaviour space:
+	•	Forward motion at multiple speeds
+	•	Turning arcs
+	•	Deceleration to stop
+	•	Decoder selects and refines the best-matching anchor per sample
+
+Key insight:
+
+If anchors don’t include a behaviour, the model cannot learn it
+
+⸻
+
+Slide 7 — Trajectory Anchors & Mode Collapse
+	•	Ka = 24 learnable templates
+	•	WTA updates only the best-matching anchor per sample
+
+Problem:
+	•	Zero initialisation → identical anchors
+	•	WTA reinforces one mode
+	•	Others receive no gradients
+
+Observed:
+	•	0/24 anchors produced stopping trajectories (T1–T5)
+	•	Measured via velocity threshold across predictions
+
+Impact:
+	•	No stopping → red light violations, failure to yield
+	•	Severe penalties in simulation
+	•	Offline ADE/FDE underweight this failure — dominated by moving frames
+
+Key insight:
+
+Mode collapse is structural, not just optimisation noise
+
+⸻
+
+Slide 8 — Fix: Geometric Anchor Initialisation (T6)
+	•	Anchors initialised with geometric diversity:
+	•	Multiple directions
+	•	Multiple speed profiles
+	•	Explicit stopping modes
+	•	Anchors frozen after initialisation:
+	•	Prevents collapse of anchor geometry under WTA
+	•	Decoder adapts around fixed anchors
+
+Results:
+	•	17/24 anchors produce stopping trajectories (epoch 2)
+	•	Previously: 0/24
+	•	Offline metrics decrease (expected)
+	•	Simulation score increases (projected 0.86–0.89)
+
+Conclusion:
+
+Anchor design directly controls reachable behaviour
+
+⸻
+
+Slide 9 — Router: Class Imbalance
+	•	Naive training:
+	•	Predicts majority class
+	•	~76% accuracy → uninformative
+
+Fixes:
+	•	Inverse-frequency class weights
+	•	WeightedRandomSampler
+	•	Label smoothing (ε = 0.1)
+
+Result:
+	•	Router accuracy → 0.94
+
+Key insight:
+
+Without balanced routing, experts cannot specialise
+
+⸻
+
+Slide 10 — Loss Function
+
+Loss	Weight	Purpose
+L_reg	1.0	Trajectory regression (xy, WTA)
+L_cls	2.0	Mode selection
+L_col	0.5	Collision penalty (ESDF)
+L_pred	1.0	Agent prediction
+L_router	1.5	Scene classification
+
+	•	Additional:
+	•	Yaw smoothness loss (×0.15)
+	•	Weights tuned empirically across runs
+	•	Early bug:
+	•	WTA selection used all channels instead of xy-only
+	•	Fix reduced minFDE from 7.16 → 1.10
+
+Key idea:
+
+Each loss targets a specific failure mode
+
+⸻
+
+Slide 11 — ESDF Collision Loss
+	•	nuPlan cost maps:
+	•	Signed distance fields (ESDF)
+
+Pipeline:
+	•	Predicted trajectory → grid coordinates
+	•	Sample ESDF via grid_sample
+	•	Negative values → collision penalty
+
+Advantages:
+	•	Fully differentiable
+	•	No explicit geometry checks
+
+Key insight:
+
+Provides direct gradient signal from collision → shapes trajectory
+
+⸻
+
+Slide 12 — Auxiliary Supervision
+	•	Applied to decoded queries (not final output):
+	•	Comfort proxy
+	•	Penalises jerk
+	•	Progress signal
+	•	Encourages forward motion
+	•	Inspired by Hydra-style supervision
+
+Role:
+	•	Improves smoothness
+	•	Stabilises training
+
+⸻
+
+Slide 13 — Training Infrastructure
+	•	Docker:
+	•	Python 3.9, PyTorch 2.0.1 + CUDA 11.8
+	•	Argo Workflows:
+	•	GPU scheduling
+	•	Automated evaluation
+	•	Data pipeline:
+	•	S3-based datasets
+	•	Chunked caching (fixes SQLite limit)
+
+Outcome:
+	•	Fully reproducible training and evaluation pipeline
+
+⸻
+
+Slide 14 — Training Progression: T1 → T6
+
+Run	minFDE	Sim Score	What changed	Key insight
+T1	7.16	~0.65	Baseline — zero anchors	Poor initialisation
+T2	1.10	~0.70	WTA fix, LR tuning	Critical bug fix
+T3	—	0.781	Endpoint loss, routing	Best confirmed sim
+T4	best offline	0.750	Temporal weighting	Offline ≠ sim
+T5	worse	worse	Ka=32 scaling	Scaling fails
+T6	worse offline	0.86–0.89*	Anchor fix	Anchors dominate
+
+*Epoch-2 projection
+
+⸻
+
+Slide 15 — Offline vs Simulation Gap
+	•	Metrics disagree systematically:
+	•	T2: best safety (TTC, collisions), lower progress
+	•	T3: best overall simulation score
+	•	T4: best offline metrics, worse simulation
+	•	T6: worst offline, best projected simulation
+
+Why:
+	•	Offline:
+	•	Frame-averaged
+	•	No rule enforcement
+	•	Simulation:
+	•	Penalises violations
+	•	Evaluates decisions
+	•	Rare events dominate simulation score
+
+Conclusion:
+
+Offline metrics useful for debugging, not model comparison
+
+Simulation score is the closest proxy to real-world driving performance
+
+⸻
+
+Slide 16 — Results
+	•	minFDE: 7.16 → 1.10 (T1 → T2)
+	•	Best safety metrics: T2
+	•	Best confirmed simulation: 0.781 (T3)
+	•	T6 projected: 0.86–0.89
+	•	Stopping anchors:
+	•	0/24 → 17/24
+	•	Router accuracy:
+	•	0.76 → 0.94
+
+Key takeaway:
+
+Improvements driven primarily by anchor design and bug fixes, not model scaling
+
+Note (verbal if needed):
+	•	PLUTO baseline comparison to be discussed during Q&A if required
+
+⸻
+
+Slide 17 — Contributions
+
+Method
+	•	Scene-aware EMoE planning with hard routing
+	•	Anchor-based structured multimodality
+
+Engineering
+	•	Full training + simulation pipeline
+	•	Differentiable ESDF collision loss
+	•	WTA channel selection bug fix (xy-only)
+
+Analysis
+	•	Identified primary cause of offline–simulation gap
+	•	Demonstrated role of anchor geometry in behaviour
+	•	Showed offline and simulation metrics measure different properties
+
+⸻
+
+Slide 18 — Conclusion
+	•	Performance primarily limited by behavioural coverage rather than model capacity
+	•	Anchor design is the highest-leverage variable
+	•	Offline and simulation metrics measure different properties
+	•	Hard MoE routing is effective and interpretable
+	•	Scene classification is learnable at scale (94% accuracy)
+
+⸻
+
+Slide 19 — Q&A
+	•	6 scene classes
+	•	Ka = 24 anchors
+	•	Hard routing (R = 1)
+	•	~800K scenarios
+	•	Best confirmed sim: 0.781
+	•	T6 projected: 0.86–0.89
+	•	Best safety: T2
+	•	Stopping anchors:
+	•	17/24 (epoch 2)
+	•	Router accuracy:
+	•	0.94
+	•	Key ablations:
+	•	Ka scaling
+	•	Routing
+	•	Anchor initialisation
+
+⸻
