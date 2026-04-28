@@ -1,330 +1,666 @@
+Good—this is the right instinct. Right now your slides are technically strong, but to feel like a thesis, it needs a clear narrative arc.
+
+Below is a story-driven version of your 7 slides (~8 min total).
+It still stays tight, confident, and explanatory, but now it flows like:
+
+Problem → Why it’s hidden → What I did → How it works → What controls behaviour → Why it works
 
 ⸻
 
-Slide 2 — Problem Setup
-	•	Learned planners (PLUTO, PDM, GameFormer) minimise average trajectory error across all scenario types
-	•	Implicit assumption: one model with enough capacity handles all behaviours
-	•	In reality:
-	•	Different scenarios require fundamentally different behaviours (e.g. stopping vs continuous motion)
-	•	A single model must represent conflicting behaviours
-	•	WTA training often collapses to a dominant mode in practice
+Slide 1 — The Core Problem (≈60 sec)
 
-Core question:
+Set up the tension
 
-What if the planner knew the scene type and activated a specialist?
+“Modern learned planners like PLUTO, PDM, and GameFormer all follow the same approach:
+they train a single model across all driving scenarios and optimise average trajectory error.”
 
-⸻
+“At first, that sounds reasonable. But it creates a fundamental problem.”
 
-Slide 3 — Why nuPlan Makes This Non-Trivial
-	•	Offline metrics (minADE / minFDE):
-	•	Averaged over recorded frames
-	•	Evaluate imitation
-	•	Closed-loop simulation:
-	•	Reactive agents
-	•	Traffic rule penalties
-	•	Progress tracking
-	•	Evaluate decision-making
-	•	Example:
-	•	A planner that never stops:
-	•	Good offline score
-	•	Fails in simulation
-	•	The evaluation gap is structural:
-	•	Offline metrics do not capture stop behaviour, yield compliance, or reactive response
-	•	Key insight: Offline metrics ≠ driving quality
-	•	Design target: optimise for simulation, not regression
+“Driving is not one task.
+Stopping at an intersection and cruising on a highway require completely different behaviours.”
+
+“So the model is forced to represent conflicting behaviours in a single set of parameters.”
+
+“This leads to two failures:
+
+	•	conflicting behaviours → the model compromises
+	•	and mode collapse → rare behaviours like stopping are ignored”
+
+“So the core question becomes:
+what if the planner knew the scene type, and used a specialist instead?”
 
 ⸻
 
-Slide 4 — Scene Classification
-	•	6 scene classes (map topology + ego intent):
-	•	Left turn (intersection)
-	•	Straight (intersection)
-	•	Right turn (intersection)
-	•	Straight (non-intersection)
-	•	U-turn
-	•	Complex / other
-	•	Dataset:
-	•	~800K scenarios
-	•	Long-tailed distribution
+Slide 2 — Why This Problem Is Hidden (≈65 sec)
 
-Key issue:
+Reveal the twist
 
-Class imbalance → router ignores rare but critical behaviours
+“The reason this problem goes unnoticed is how planners are evaluated.”
 
-⸻
+“In open-loop evaluation, we compare predicted trajectories to human trajectories using metrics like minADE and minFDE.”
 
-Slide 5 — EMoE Architecture
+“But this only measures imitation.
+The trajectory is never executed.”
 
-Built on PLUTO with 3 additions:
-	•	SceneRouter
-	•	Predicts scene class
-	•	Inverse-frequency weighted loss
-	•	SceneModeQueryGenerator (Hard)
-	•	Routes each sample to exactly one expert (R = 1)
-	•	EMoEPlanningDecoder
-	•	Expert-specific decoding
-	•	Ka = 24 anchors
-	•	FOPE positional encoding
-	•	score_attn → pi_head → output
+“In closed-loop simulation, the trajectory is executed:
 
-Design choice — Hard routing (R = 1):
-	•	One expert accountable per scene
-	•	Avoids gradient interference between experts
-	•	Interpretable at inference
-
-Key idea:
-
-Each expert learns a restricted behaviour space → reduces interference
+	•	agents react
+	•	traffic rules are enforced
+	•	safety and progress are evaluated”
 
 ⸻
 
-Slide 6 — What is an Anchor?
-	•	Each anchor = a learnable trajectory template representing one possible future
-	•	Ka = 24 anchors collectively cover behaviour space:
-	•	Forward motion at multiple speeds
-	•	Turning arcs
-	•	Deceleration to stop
-	•	Decoder selects and refines the best-matching anchor per sample
+“And this leads to a critical observation from my experiments:
+a planner that never stops can still score well in open-loop.”
 
-Key insight:
-
-If anchors don’t include a behaviour, the model cannot learn it
+“But in simulation, it fails completely—running red lights and causing collisions.”
 
 ⸻
 
-Slide 7 — Trajectory Anchors & Mode Collapse
-	•	Ka = 24 learnable templates
-	•	WTA updates only the best-matching anchor per sample
-
-Problem:
-	•	Zero initialisation → identical anchors
-	•	WTA reinforces one mode
-	•	Others receive no gradients
-
-Observed:
-	•	0/24 anchors produced stopping trajectories (T1–T5)
-	•	Measured via velocity threshold across predictions
-
-Impact:
-	•	No stopping → red light violations, failure to yield
-	•	Severe penalties in simulation
-	•	Offline ADE/FDE underweight this failure — dominated by moving frames
-
-Key insight:
-
-Mode collapse is structural, not just optimisation noise
+“So the conclusion is:
+open-loop metrics can hide critical failures.
+Simulation performance is the real objective.”
 
 ⸻
 
-Slide 8 — Fix: Geometric Anchor Initialisation (T6)
-	•	Anchors initialised with geometric diversity:
-	•	Multiple directions
-	•	Multiple speed profiles
-	•	Explicit stopping modes
-	•	Anchors frozen after initialisation:
-	•	Prevents collapse of anchor geometry under WTA
-	•	Decoder adapts around fixed anchors
+Slide 3 — The Idea: EMoE (≈60 sec)
 
-Results:
-	•	17/24 anchors produce stopping trajectories (epoch 2)
-	•	Previously: 0/24
-	•	Offline metrics decrease (expected)
-	•	Simulation score increases (projected 0.86–0.89)
+Introduce your solution as the answer
 
-Conclusion:
+“So to address this, I propose a Scene-Adaptive Mixture of Experts.”
 
-Anchor design directly controls reachable behaviour
+“Instead of one model learning everything, we decompose the problem.”
+
+“The pipeline is simple:
+
+	•	classify the scene
+	•	route it to a specialist
+	•	generate trajectories within that behaviour space”
 
 ⸻
 
-Slide 9 — Router: Class Imbalance
-	•	Naive training:
-	•	Predicts majority class
-	•	~76% accuracy → uninformative
+“The key design choice is hard routing:
+each scenario is handled by exactly one expert.”
 
-Fixes:
-	•	Inverse-frequency class weights
-	•	WeightedRandomSampler
-	•	Label smoothing (ε = 0.1)
-
-Result:
-	•	Router accuracy → 0.94
-
-Key insight:
-
-Without balanced routing, experts cannot specialise
+“This removes interference between behaviours and allows each expert to specialise.”
 
 ⸻
 
-Slide 10 — Loss Function
-
-Loss	Weight	Purpose
-L_reg	1.0	Trajectory regression (xy, WTA)
-L_cls	2.0	Mode selection
-L_col	0.5	Collision penalty (ESDF)
-L_pred	1.0	Agent prediction
-L_router	1.5	Scene classification
-
-	•	Additional:
-	•	Yaw smoothness loss (×0.15)
-	•	Weights tuned empirically across runs
-	•	Early bug:
-	•	WTA selection used all channels instead of xy-only
-	•	Fix reduced minFDE from 7.16 → 1.10
-
-Key idea:
-
-Each loss targets a specific failure mode
+“So instead of averaging behaviours, we explicitly separate them.”
 
 ⸻
 
-Slide 11 — ESDF Collision Loss
-	•	nuPlan cost maps:
-	•	Signed distance fields (ESDF)
+Slide 4 — Defining the Behaviour Space (≈65 sec)
 
-Pipeline:
-	•	Predicted trajectory → grid coordinates
-	•	Sample ESDF via grid_sample
-	•	Negative values → collision penalty
+Make it concrete
 
-Advantages:
-	•	Fully differentiable
-	•	No explicit geometry checks
+“To make this work, we first define six scene classes based on map topology and ego intent:
+left, straight, right at intersections, straight outside intersections, U-turns, and complex scenarios.”
 
-Key insight:
+“The dataset contains about 850,000 scenarios—but it is highly imbalanced.”
 
-Provides direct gradient signal from collision → shapes trajectory
+“Most data comes from straight and simple intersection scenarios, while U-turns and complex cases are rare.”
 
 ⸻
 
-Slide 12 — Auxiliary Supervision
-	•	Applied to decoded queries (not final output):
-	•	Comfort proxy
-	•	Penalises jerk
-	•	Progress signal
-	•	Encourages forward motion
-	•	Inspired by Hydra-style supervision
-
-Role:
-	•	Improves smoothness
-	•	Stabilises training
+“If we train naively, the model ignores these rare scenarios, and the router collapses to majority classes.”
 
 ⸻
 
-Slide 13 — Training Infrastructure
-	•	Docker:
-	•	Python 3.9, PyTorch 2.0.1 + CUDA 11.8
-	•	Argo Workflows:
-	•	GPU scheduling
-	•	Automated evaluation
-	•	Data pipeline:
-	•	S3-based datasets
-	•	Chunked caching (fixes SQLite limit)
+“So we explicitly correct this using:
 
-Outcome:
-	•	Fully reproducible training and evaluation pipeline
+	•	class-balanced loss
+	•	and oversampling”
 
 ⸻
 
-Slide 14 — Training Progression: T1 → T6
-
-Run	minFDE	Sim Score	What changed	Key insight
-T1	7.16	~0.65	Baseline — zero anchors	Poor initialisation
-T2	1.10	~0.70	WTA fix, LR tuning	Critical bug fix
-T3	—	0.781	Endpoint loss, routing	Best confirmed sim
-T4	best offline	0.750	Temporal weighting	Offline ≠ sim
-T5	worse	worse	Ka=32 scaling	Scaling fails
-T6	worse offline	0.86–0.89*	Anchor fix	Anchors dominate
-
-*Epoch-2 projection
+“This is critical—without it, expert specialisation does not happen.”
 
 ⸻
 
-Slide 15 — Offline vs Simulation Gap
-	•	Metrics disagree systematically:
-	•	T2: best safety (TTC, collisions), lower progress
-	•	T3: best overall simulation score
-	•	T4: best offline metrics, worse simulation
-	•	T6: worst offline, best projected simulation
+Slide 5 — How EMoE Works (≈70 sec)
 
-Why:
-	•	Offline:
-	•	Frame-averaged
-	•	No rule enforcement
-	•	Simulation:
-	•	Penalises violations
-	•	Evaluates decisions
-	•	Rare events dominate simulation score
+Explain the system cleanly
 
-Conclusion:
+“The architecture has three components.”
 
-Offline metrics useful for debugging, not model comparison
+“First, the SceneRouter classifies the scene using the shared encoder.”
 
-Simulation score is the closest proxy to real-world driving performance
+“Second, hard routing selects exactly one expert for that scenario.”
+
+“Third, the expert decoder generates trajectories.”
 
 ⸻
 
-Slide 16 — Results
-	•	minFDE: 7.16 → 1.10 (T1 → T2)
-	•	Best safety metrics: T2
-	•	Best confirmed simulation: 0.781 (T3)
-	•	T6 projected: 0.86–0.89
-	•	Stopping anchors:
-	•	0/24 → 17/24
-	•	Router accuracy:
-	•	0.76 → 0.94
+“Each expert has its own parameters and its own behaviour space.”
 
-Key takeaway:
+“This means:
 
-Improvements driven primarily by anchor design and bug fixes, not model scaling
-
-Note (verbal if needed):
-	•	PLUTO baseline comparison to be discussed during Q&A if required
+	•	left-turn expert learns turning behaviour
+	•	straight expert learns cruising behaviour”
 
 ⸻
 
-Slide 17 — Contributions
+“This also makes the system interpretable—you can trace every decision to a specific expert.”
+
+⸻
+
+Slide 6 — What Actually Controls Behaviour (≈70 sec)
+
+Your strongest insight
+
+“The most important component in the system is trajectory anchors.”
+
+“Anchors are prototype trajectories that define what the model can produce.”
+
+“Each anchor corresponds to a behaviour:
+
+	•	forward motion
+	•	turning
+	•	stopping”
+
+⸻
+
+“The model generates 24 candidate trajectories—one per anchor—and selects the best.”
+
+⸻
+
+“The key constraint is:
+if a behaviour is not in the anchors, the model cannot learn it.”
+
+⸻
+
+“In early experiments, none of the anchors represented stopping.
+So in simulation, the planner simply never stopped.”
+
+⸻
+
+“This shows that anchor design directly determines what behaviours are possible.”
+
+⸻
+
+Slide 7 — How We Train It (≈65 sec)
+
+Close the loop cleanly
+
+“Finally, the model is trained using a structured loss design.”
+
+“Each loss targets a specific failure mode.”
+
+⸻
+
+“Trajectory regression ensures accurate motion, using Winner-Takes-All with position-based selection.”
+
+“Classification loss ensures the correct trajectory is selected at inference.”
+
+“Collision loss penalises unsafe trajectories using differentiable SDF maps.”
+
+“Routing loss trains the scene classifier, and prediction loss improves scene understanding.”
+
+⸻
+
+“So the system is trained to:
+
+	•	produce correct trajectories
+	•	select the right one
+	•	remain safe
+	•	and route to the correct expert”
+
+⸻
+
+Good—this is the most important section of your talk, and your notes  ￼ are already strong.
+I’ll now convert ALL slides (8–16) into the same story-driven, concise, ~8–9 min flow, consistent with Part 1.
+
+Structure:
+	•	~50–60 sec per slide
+	•	tighter, less open to questioning
+	•	clear narrative progression: baseline → fix → best model → failures → diagnosis → insight
+
+⸻
+
+Slide 8 — T1–T2: Safe but Limited (≈55 sec)
+
+Start from baseline — set contrast
+
+“I’ll now move to results, starting with the baseline behaviour.”
+
+“T1 and T2 follow a standard PLUTO-style setup:
+single-mode WTA and basic losses, without expert specialisation.”
+
+⸻
+
+“The behaviour is consistent: very safe, but overly conservative.”
+
+“The planner maintains strong TTC and avoids collisions, but fails to make progress.”
+
+⸻
+
+“The reason is structural:
+with only one trajectory mode, the model produces an averaged behaviour.”
+
+⸻
+
+“So instead of committing to actions, it hedges—
+which is safe, but ineffective in complex scenarios like intersections.”
+
+⸻
+
+“This gives us a strong safety baseline, but lacks expressiveness.”
+
+⸻
+
+Slide 9 — Two Critical Fixes (≈60 sec)
+
+Turning point in the story
+
+“The first real improvement came from fixing two structural issues.”
+
+⸻
+
+WTA bug
+
+“Winner-Takes-All originally selected the best mode using all trajectory channels.”
+
+“This caused incorrect supervision.”
+
+“Restricting selection to position only fixed this.”
+
+“minFDE dropped from 7.16 to 1.10.”
+
+⸻
+
+Router imbalance
+
+“The router collapsed to predicting the majority class.”
+
+“This made expert specialisation ineffective.”
+
+⸻
+
+“We fixed this using:
+
+	•	class-balanced loss
+	•	oversampling
+	•	label smoothing”
+
+⸻
+
+“Router accuracy improved from 0.76 to 0.94.”
+
+⸻
+
+“These were not tuning improvements—
+they made correct learning possible.”
+
+⸻
+
+Slide 10 — T3: Best Model (≈55 sec)
+
+Your peak result
+
+“With these fixes, T3 becomes the best-performing model.”
+
+⸻
+
+“Two key changes:
+learnable anchors and a more expressive decoder.”
+
+⸻
+
+“This enables the model to generate diverse trajectories instead of a single averaged path.”
+
+⸻
+
+“T3 achieves a simulation score of approximately 0.78.”
+
+⸻
+
+“Importantly, straight driving is essentially solved, with a score of 0.94.”
+
+⸻
+
+“However, turning scenarios remain weaker.”
+
+⸻
+
+“So T3 gives the best overall trade-off, but also clearly exposes the remaining bottleneck.”
+
+⸻
+
+Slide 11 — Lessons from T4–T8 (≈55 sec)
+
+Show maturity — what didn’t work
+
+“We then explored additional improvements, but most degraded performance.”
+
+⸻
+
+T6
+
+“Over-regularisation led to mode collapse and near-stationary behaviour.”
+
+⸻
+
+T7
+
+“Ranking-based objectives were misaligned with simulation, causing instability.”
+
+⸻
+
+T8
+
+“Reducing complexity restored stability, but did not solve interaction issues.”
+
+⸻
+
+“The key lesson is:
+more complexity does not improve performance.”
+
+⸻
+
+“Every addition must target a specific failure mode.”
+
+⸻
+
+Slide 12 — Open-loop Evaluation (≈55 sec)
+
+Set up the contradiction
+
+“In open-loop metrics, T3 performs competitively with the baseline.”
+
+⸻
+
+“PredAvgFDE matches the paper: 2.11 vs 2.12.”
+
+⸻
+
+“This shows that adding EMoE does not degrade trajectory prediction quality.”
+
+⸻
+
+“However, this table does not reflect actual driving behaviour.”
+
+⸻
+
+“We observed cases where models with better open-loop metrics performed worse in simulation.”
+
+⸻
+
+“So open-loop metrics are useful for debugging, but not for evaluating planning quality.”
+
+⸻
+
+Slide 13 — Closed-loop Evaluation (≈60 sec)
+
+Reveal the real performance
+
+“Closed-loop results tell the full story.”
+
+⸻
+
+“T3 achieves an overall score of 0.78.”
+
+⸻
+
+“Progress and compliance are strong, around 0.97–0.98.”
+
+⸻
+
+“The bottleneck is interaction safety:
+TTC is 0.80, collision is 0.88.”
+
+⸻
+
+“Looking at experts:
+
+	•	straight expert: 0.94
+	•	turn experts: around 0.64”
+
+⸻
+
+“So the model works well globally, but fails in specific regimes.”
+
+⸻
+
+Slide 14 — Expert Diagnostics (≈55 sec)
+
+Make the contrast undeniable
+
+“This slide makes the gap explicit.”
+
+⸻
+
+“Straight driving is effectively solved.”
+
+⸻
+
+“Turn experts range from 0.58 to 0.70.”
+
+⸻
+
+“The difference is not small—it’s over 25 percentage points.”
+
+⸻
+
+“Importantly:
+progress and compliance are still strong in these cases.”
+
+⸻
+
+“So the failure is not global—it is specific to turning behaviour.”
+
+⸻
+
+“This is a localized and diagnosable problem.”
+
+⸻
+
+Slide 15 — Root Cause: Why Turns Fail (≈60 sec)
+
+Your strongest analytical slide
+
+“Turning failures follow a consistent pattern:
+low TTC, higher collisions, and poor comfort.”
+
+⸻
+
+“This points to three root causes.”
+
+⸻
+
+1. No interaction reasoning
+
+“The model treats other agents as static obstacles, not as reactive participants.”
+
+⸻
+
+2. Incorrect turn geometry
+
+“Anchors do not capture correct turn curvature.”
+
+⸻
+
+3. Insufficient diversity
+
+“There are not enough turn trajectory variants.”
+
+⸻
+
+“So the model approximates turns, but does not execute them correctly.”
+
+⸻
+
+“Importantly, all three issues are localized and fixable.”
+
+⸻
+
+Slide 16 — Final Insight: OL vs CL Gap (≈65 sec)
+
+Close the story strongly
+
+“This final slide brings everything together.”
+
+⸻
+
+“Different training runs rank differently depending on the metric.”
+
+⸻
+
+“T2 performs best in open-loop, but worse in simulation.”
+
+“T3 performs best in simulation.”
+
+“T4 improves some safety metrics, but not overall performance.”
+
+⸻
+
+“This shows that offline metrics and simulation measure fundamentally different things.”
+
+⸻
+
+“Offline metrics average over frames and ignore rare failures.”
+
+“Simulation evaluates sequential decisions and penalises critical errors.”
+
+⸻
+
+“So the conclusion is:
+offline metrics are necessary, but not sufficient.”
+
+⸻
+
+“Simulation performance is the ground truth for planning.”
+
+⸻
+
+
+Slide 17 — Contributions (≈60–65 sec)
+
+Own your work. No hesitation.
+
+“I’ll summarise the contributions of this thesis across three areas: method, engineering, and analysis.”
+
+⸻
 
 Method
-	•	Scene-aware EMoE planning with hard routing
-	•	Anchor-based structured multimodality
+
+“First, on the method side:
+I developed a scene-aware mixture-of-experts architecture for motion planning.”
+
+“Instead of a single model, scenarios are explicitly routed to specialised experts, which improves behavioural consistency.”
+
+“I also introduced anchor-based multimodal outputs with classification and collision-aware losses—
+a structured training setup where each component targets a specific failure mode.”
+
+⸻
 
 Engineering
-	•	Full training + simulation pipeline
-	•	Differentiable ESDF collision loss
-	•	WTA channel selection bug fix (xy-only)
+
+“On the engineering side:
+I built a fully reproducible, scalable pipeline for training and evaluation on ~850,000 scenarios.”
+
+“This includes stable training through the WTA fix, routing corrections, and structured loss design.”
+
+⸻
 
 Analysis
-	•	Identified primary cause of offline–simulation gap
-	•	Demonstrated role of anchor geometry in behaviour
-	•	Showed offline and simulation metrics measure different properties
+
+“On the analysis side:
+I empirically quantified the gap between open-loop and simulation metrics across multiple runs.”
+
+“And showed that behavioural coverage—especially in rare scenarios—is critical for closed-loop performance.”
 
 ⸻
 
-Slide 18 — Conclusion
-	•	Performance primarily limited by behavioural coverage rather than model capacity
-	•	Anchor design is the highest-leverage variable
-	•	Offline and simulation metrics measure different properties
-	•	Hard MoE routing is effective and interpretable
-	•	Scene classification is learnable at scale (94% accuracy)
+Close
+
+“Importantly, these insights are not specific to nuPlan—they apply to any multimodal planning system evaluated in simulation.”
 
 ⸻
 
-Slide 19 — Q&A
-	•	6 scene classes
-	•	Ka = 24 anchors
-	•	Hard routing (R = 1)
-	•	~800K scenarios
-	•	Best confirmed sim: 0.781
-	•	T6 projected: 0.86–0.89
-	•	Best safety: T2
-	•	Stopping anchors:
-	•	17/24 (epoch 2)
-	•	Router accuracy:
-	•	0.94
-	•	Key ablations:
-	•	Ka scaling
-	•	Routing
-	•	Anchor initialisation
+Slide 18 — Conclusion (≈65–70 sec)
+
+Your thesis distilled — slow down here
+
+“This thesis leads to three key findings.”
 
 ⸻
+
+1. Routing drives structure
+
+“Scene-aware routing produces coherent, context-specific behaviour.”
+
+“Without it, a single model averages across incompatible behaviours and becomes insufficient.”
+
+⸻
+
+2. Stability gives performance
+
+“The best model, T3, succeeds not through added complexity, but through balanced training.”
+
+“Later runs added complexity and became unstable.”
+
+“So alignment and stability are more important than architectural complexity.”
+
+⸻
+
+3. Metrics measure different things
+
+“Open-loop and simulation metrics are not interchangeable.”
+
+“Closed-loop behaviour in critical scenarios is the true measure of planning quality.”
+
+⸻
+
+Final line — pause before this
+
+“So the central takeaway is:
+structured modelling and behavioural coverage are the key levers for improving autonomous driving planners.”
+
+⸻
+
+Slide 19 — Open Questions / Next Steps (≈60–65 sec)
+
+End upward, not defensive
+
+“I’ll close with the remaining challenges, framed as next steps.”
+
+⸻
+
+1. Rare behaviour coverage
+
+“Long-tail scenarios like U-turns and complex interactions remain underrepresented.”
+
+“Next step: targeted augmentation and curriculum learning.”
+
+⸻
+
+2. Offline proxy validity
+
+“Current offline metrics do not predict simulation performance.”
+
+“Better proxy metrics would significantly accelerate development.”
+
+⸻
+
+3. Routing generalisation
+
+“The router achieves 0.94 accuracy, but failure cases are not fully understood.”
+
+“Next step: analysing misclassifications and improving robustness.”
+
+⸻
+
+Close strong
+
+“So the work is not complete, but the direction is clear.”
+
+“The foundation is solid, and the next steps are well-defined.”
+
+⸻
+
+Final sentence (look up)
+
+“I’m happy to take questions.”
+
+
